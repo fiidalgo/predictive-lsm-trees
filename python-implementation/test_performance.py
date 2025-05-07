@@ -189,8 +189,11 @@ class PerformanceTest:
         return True
     
     def _train_ml_models(self):
-        """Train ML models on the loaded data."""
+        """Load pre-trained ML models instead of training them again."""
         start_time = time.time()
+        
+        # Instead of training, just load the trained models
+        print("Loading pre-trained ML models...")
         
         # Get all runs from the traditional tree
         trad_stats = self.traditional_tree.get_stats()
@@ -200,168 +203,42 @@ class PerformanceTest:
         for level_stats in trad_stats.get('levels', []):
             run_count += level_stats.get('run_count', 0)
         
-        print(f"Training on data from {run_count} runs across all levels...")
+        print(f"Using existing models for {run_count} runs across all levels")
         
-        # Ensure the modules are loaded properly
-        import random
-        import struct
+        # Check if the ML models exist
+        ml_models_dir = os.path.join(self.learned_dir, "ml_models")
+        bloom_model_path = os.path.join(ml_models_dir, "bloom_model.pkl")
+        fence_model_path = os.path.join(ml_models_dir, "fence_model.pkl")
         
-        # IMPORTANT: Use the ORIGINAL data directory for training, not the learned directory!
-        total_keys_added = 0
-        total_negative_samples = 0
-        
-        # Directly access traditional tree runs for training
-        for level_idx, level in enumerate(self.traditional_tree.levels):
-            if not level.runs:
-                continue
-                
-            print(f"Training models for Level {level_idx} with {len(level.runs)} runs...")
-            
-            # Train models for each run in the ORIGINAL tree
-            for run in level.runs:
-                try:
-                    # Load run data
-                    with open(run.file_path, 'rb') as f:
-                        data = pickle.load(f)
-                        pairs = data.get('pairs', [])
-                        
-                        if not pairs:
-                            print(f"  Run {run.file_path} has no data, skipping")
-                            continue
-                            
-                        print(f"  Processing run with {len(pairs)} entries")
-                        
-                        # Sample data if needed to speed up training
-                        if len(pairs) > 10000:
-                            print(f"  Sampling {10000} records from {len(pairs)} for faster training")
-                            pairs = random.sample(pairs, 10000)
-                        
-                        # Get key set for generating negative samples
-                        key_set = set()
-                        
-                        # Calculate page boundaries
-                        records_per_page = run.page_size // Constants.ENTRY_SIZE_BYTES
-                        
-                        # Get min/max key range
-                        min_key = run.min_key
-                        max_key = run.max_key
-                        
-                        if isinstance(min_key, bytes):
-                            min_key = struct.unpack('!d', min_key[:8])[0]
-                        if isinstance(max_key, bytes):
-                            max_key = struct.unpack('!d', max_key[:8])[0]
-                        
-                        # Process each key-value pair
-                        keys_added = 0
-                        for i, (key, _) in enumerate(pairs):
-                            # Convert key from bytes to float if needed
-                            if isinstance(key, bytes):
-                                key = struct.unpack('!d', key[:8])[0]
-                                
-                            # Add to key set
-                            key_set.add(key)
-                            
-                            # Calculate page id
-                            page_id = i // records_per_page
-                            
-                            # Add to training data
-                            self.learned_tree.ml_models.add_bloom_training_data(key, True)  # Key exists
-                            self.learned_tree.ml_models.add_fence_training_data(key, level_idx, page_id)
-                            keys_added += 1
-                            
-                        total_keys_added += keys_added
-                        print(f"  Added {keys_added} positive training samples")
-                        
-                        # Generate negative samples for bloom filter training
-                        negative_samples = 0
-                        if min_key is not None and max_key is not None and min_key < max_key:
-                            key_range = max_key - min_key
-                            # Generate as many negative samples as positive samples for better class balance
-                            num_negative_samples = min(len(pairs), 10000)  # Use same sample size as positive samples
-                            
-                            print(f"  Adding {num_negative_samples} negative samples for class balance")
-                            
-                            for _ in range(num_negative_samples):
-                                # Generate a key outside the range
-                                fake_key = random.uniform(min_key - key_range * 0.1, max_key + key_range * 0.1)
-                                
-                                # Ensure it's not an actual key
-                                if fake_key not in key_set:
-                                    self.learned_tree.ml_models.add_bloom_training_data(fake_key, False)
-                                    negative_samples += 1
-                            
-                            total_negative_samples += negative_samples
-                            print(f"  Successfully added {negative_samples} negative samples")
-                    
-                except Exception as e:
-                    print(f"  Error processing run: {e}")
-                    import traceback
-                    traceback.print_exc()
-        
-        print(f"Total training data collected: {total_keys_added} positive samples, {total_negative_samples} negative samples")
-        if total_keys_added == 0:
-            print("ERROR: No training data collected, models cannot be trained!")
+        if not os.path.exists(bloom_model_path) or not os.path.exists(fence_model_path):
+            print(f"ERROR: Pre-trained models not found at {ml_models_dir}")
+            print("Please run train_models.py first to create the models!")
             return
-            
-        # Train the models with all the collected data
-        print("Training ML models with collected data...")
         
-        # Check if there's any training data
-        bloom_data_size = len(self.learned_tree.ml_models.bloom_data) if hasattr(self.learned_tree.ml_models, 'bloom_data') else 0
-        fence_data_size = len(self.learned_tree.ml_models.fence_data) if hasattr(self.learned_tree.ml_models, 'fence_data') else 0
-        print(f"Bloom filter training data: {bloom_data_size} samples")
-        print(f"Fence pointer training data: {fence_data_size} samples")
-        
+        # Load models for the learned tree
         try:
-            # Get initial accuracy values for comparison
-            init_bloom_acc = self.learned_tree.ml_models.get_bloom_accuracy()
-            init_fence_acc = self.learned_tree.ml_models.get_fence_accuracy()
+            print(f"Loading models from {ml_models_dir}")
+            self.learned_tree.ml_models.load_models()
             
-            # Display proper initialization message instead of misleading accuracy
-            print(f"Starting model training from initial state. No accuracy metrics available yet.")
+            # Get accuracy metrics
+            bloom_acc = self.learned_tree.ml_models.get_bloom_accuracy()
+            fence_acc = self.learned_tree.ml_models.get_fence_accuracy()
             
-            # Time the bloom filter training
-            bloom_start = time.time()
-            self.learned_tree.ml_models.train_bloom_model()
-            bloom_time = time.time() - bloom_start
-            print(f"Bloom filter model training completed in {bloom_time:.2f} seconds")
-            
-            # Time the fence pointer training
-            fence_start = time.time()
-            self.learned_tree.ml_models.train_fence_model()
-            fence_time = time.time() - fence_start
-            print(f"Fence pointer model training completed in {fence_time:.2f} seconds")
+            print(f"Models loaded successfully")
+            print(f"Bloom Filter Accuracy: {bloom_acc:.2%}")
+            print(f"Fence Pointer Accuracy: {fence_acc:.2%}")
             
             # Update statistics
-            new_bloom_acc = self.learned_tree.ml_models.get_bloom_accuracy()
-            new_fence_acc = self.learned_tree.ml_models.get_fence_accuracy()
-            
-            # Check if accuracy values actually changed
-            if abs(new_bloom_acc - init_bloom_acc) < 0.0001:
-                print("WARNING: Bloom filter accuracy didn't change after training! Training might not be working.")
-            
-            if abs(new_fence_acc - init_fence_acc) < 0.0001:
-                print("WARNING: Fence pointer accuracy didn't change after training! Training might not be working.")
-                
-            self.learned_tree.training_stats['bloom']['last_accuracy'] = new_bloom_acc
-            self.learned_tree.training_stats['fence']['last_accuracy'] = new_fence_acc
-            
-            print(f"New accuracy values: Bloom Filter: {new_bloom_acc:.2%}, Fence Pointer: {new_fence_acc:.2%}")
+            self.learned_tree.training_stats['bloom']['last_accuracy'] = bloom_acc
+            self.learned_tree.training_stats['fence']['last_accuracy'] = fence_acc
             
         except Exception as e:
-            print(f"Error training models: {e}")
+            print(f"Error loading models: {e}")
             import traceback
             traceback.print_exc()
         
         elapsed = time.time() - start_time
-        print(f"ML model training complete in {elapsed:.2f} seconds")
-        
-        # Get ML model stats
-        stats = self.learned_tree.get_stats()
-        if 'ml_models' in stats:
-            ml_stats = stats['ml_models']
-            print(f"Bloom Filter Accuracy: {ml_stats.get('bloom_accuracy', 0):.2%}")
-            print(f"Fence Pointer Accuracy: {ml_stats.get('fence_accuracy', 0):.2%}")
+        print(f"Model loading complete in {elapsed:.2f} seconds")
         
     def _time_operation(self, tree, func_name, *args, **kwargs):
         """Time an operation with high precision."""

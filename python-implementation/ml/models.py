@@ -5,6 +5,7 @@ import joblib
 import os
 from typing import List, Tuple, Optional, Dict, Set
 import pickle
+from collections import Counter
 
 # Try to import Numba for optimization, but make it optional
 try:
@@ -196,507 +197,308 @@ def predict_fence_numba(keys, level_min_key, level_max_key, page_count, example_
     return results
 
 class FastBloomFilter:
-    """Ultra-fast bloom filter approximation"""
-    def __init__(self, error_rate=0.01, capacity=10000):
-        self.min_key = float('inf')
-        self.max_key = float('-inf')
-        self.positive_ranges = []  # Ranges of keys that exist
-        self.negative_ranges = []  # Ranges of keys that definitely don't exist
-        self.example_keys = set()  # Set of example keys for exact matches
-        self.hash_ranges = {}  # Hash buckets for approximate membership
-        self.buckets = 64  # Number of hash buckets
-        # For accuracy calculation
-        self.true_positives = 0
-        self.false_positives = 0
-        self.true_negatives = 0
-        self.false_negatives = 0
-        # Flag to track if we've been trained
-        self.is_trained = False
+    """Fast ML-based bloom filter predictor.
+    
+    This model predicts EXACTLY ONE LEVEL where a key is most likely to be found,
+    allowing us to skip bloom filter checks for all other levels.
+    """
+    
+    def __init__(self):
+        # Classification model that predicts which specific level contains the key
+        self.model = None
+        self.trained = False
+        self.accuracy = 0.0
+        self.stats = {'correct': 0, 'total': 0}
+        self.level_distribution = {}  # Track predictions per level
+        self.min_max_keys = {}  # Store min/max keys per level for feature engineering
         
-    def train(self, keys, exists):
-        """Train the fast bloom filter"""
-        # Set trained flag
-        self.is_trained = True
+    def train(self, X, y_levels):
+        """Train the bloom filter model to predict which single level contains a key.
         
-        # Reset accuracy counters
-        self.true_positives = 0
-        self.false_positives = 0
-        self.true_negatives = 0
-        self.false_negatives = 0
+        X: List of keys as features
+        y_levels: List of level numbers where each key exists (or -1 if key doesn't exist)
+        """
+        from sklearn.ensemble import GradientBoostingClassifier
+        from sklearn.model_selection import train_test_split
+        import numpy as np
+        import time
         
-        # Find positive and negative keys
-        positive_keys = [k for k, e in zip(keys, exists) if e]
-        negative_keys = [k for k, e in zip(keys, exists) if not e]
+        if len(X) == 0 or len(y_levels) == 0:
+            print("Error: No training data provided")
+            return False
         
-        if not positive_keys:
-            return
+        # Compute min/max keys per level for better feature engineering
+        keys_by_level = {}
+        for i, level in enumerate(y_levels):
+            if level != -1:  # Skip non-existent keys
+                if level not in keys_by_level:
+                    keys_by_level[level] = []
+                keys_by_level[level].append(X[i])
+        
+        # Store min/max for each level
+        self.min_max_keys = {}
+        for level, keys in keys_by_level.items():
+            self.min_max_keys[level] = (min(keys), max(keys))
             
-        self.min_key = min(positive_keys)
-        self.max_key = max(positive_keys)
-        
-        # Clear existing data
-        self.positive_ranges = []
-        self.negative_ranges = []
-        self.example_keys = set()
-        self.hash_ranges = {}
-        
-        # Store some exact keys for fast lookups (all positive samples)
-        if len(positive_keys) > 0:
-            self.example_keys = set(random.sample(positive_keys, min(1000, len(positive_keys))))
-        
-        # Create hash buckets - only for positive keys
-        for k in positive_keys:
-            bucket = hash(k) % self.buckets
-            if bucket not in self.hash_ranges:
-                self.hash_ranges[bucket] = []
-            self.hash_ranges[bucket].append(k)
+        # Create engineered features
+        X_features = self._create_features(X)
             
-        # Find empty ranges - an important optimization for filtering
-        if len(positive_keys) > 1:
-            positive_keys.sort()
+        # Format input data for model
+        X_formatted = np.array(X_features)
+        y_levels = np.array(y_levels)
+        
+        # Split data for training and validation
+        X_train, X_val, y_train, y_val = train_test_split(X_formatted, y_levels, test_size=0.2, random_state=42, stratify=y_levels)
+        
+        print(f"Training level predictor with {len(X_train)} samples, validating with {len(X_val)} samples")
+        
+        # Count the number of examples per level for reporting
+        unique_levels, counts = np.unique(y_train, return_counts=True)
+        level_counts = {int(level): int(count) for level, count in zip(unique_levels, counts)}
+        print(f"Level distribution in training data: {level_counts}")
+        
+        start_time = time.time()
+        
+        # Train a more powerful classifier to predict which level contains the key
+        self.model = GradientBoostingClassifier(
+            n_estimators=200,        # More trees for better accuracy
+            max_depth=6,             # Deeper trees to capture more patterns
+            learning_rate=0.1,       # Good default learning rate
+            random_state=42,
+            subsample=0.8            # Use 80% of samples per tree for robustness
+        )
+        self.model.fit(X_train, y_train)
+        
+        # Evaluate on validation set
+        self.trained = True
+        y_pred = self.model.predict(X_val)
+        
+        # Calculate accuracy metrics
+        correct = np.sum(y_pred == y_val)
+        total = len(y_val)
+        accuracy = correct / total if total > 0 else 0
+        
+        # Track level distribution in predictions
+        pred_levels, pred_counts = np.unique(y_pred, return_counts=True)
+        self.level_distribution = {int(level): int(count) for level, count in zip(pred_levels, pred_counts)}
+        
+        # Store stats
+        self.stats = {'correct': int(correct), 'total': int(total)}
+        self.accuracy = accuracy
+        
+        end_time = time.time()
+        training_time_ms = (end_time - start_time) * 1000
+        
+        print(f"Level predictor trained in {training_time_ms:.2f}ms")
+        print(f"Level prediction accuracy: {accuracy:.2%}")
+        print(f"Predicted level distribution: {self.level_distribution}")
+        
+        # Print feature importances
+        if hasattr(self.model, 'feature_importances_'):
+            importances = self.model.feature_importances_
+            feature_names = [f"Feature {i}" for i in range(len(importances))]
+            sorted_indices = np.argsort(importances)[::-1]
+            print("Feature importances:")
+            for i in sorted_indices[:5]:  # Top 5 features
+                print(f"  {feature_names[i]}: {importances[i]:.4f}")
+                
+        return True
+    
+    def _create_features(self, keys):
+        """Create rich features for the model from raw keys.
+        
+        Better features help the model make more accurate predictions.
+        """
+        import numpy as np
+        features = []
+        
+        for key in keys:
+            key_float = float(key)
             
-            # Add negative ranges between positive key clusters
-            for i in range(len(positive_keys)-1):
-                gap = positive_keys[i+1] - positive_keys[i]
-                if gap > 1.0:  # Gap larger than 1.0 - a significant gap
-                    # Create a negative range in the middle of the gap
-                    middle = (positive_keys[i] + positive_keys[i+1]) / 2
-                    radius = gap * 0.35  # Use 35% of gap size for the negative range
-                    self.negative_ranges.append((middle - radius, middle + radius))
+            # Basic features
+            feature_vector = [key_float]
+            
+            # Add distance to min/max of each level features
+            for level, (min_key, max_key) in self.min_max_keys.items():
+                # Normalized position within level range
+                if max_key > min_key:
+                    position_in_level = (key_float - min_key) / (max_key - min_key)
+                    feature_vector.append(position_in_level)
                     
-        # Add additional negative ranges from known negative examples
-        # This improves filter performance tremendously
-        if negative_keys:
-            negative_keys.sort()
-            
-            # Find clusters of negative keys
-            cluster_start = 0
-            for i in range(1, len(negative_keys)):
-                if negative_keys[i] - negative_keys[i-1] > 1.0:
-                    # Process this cluster if it has enough keys
-                    if i - cluster_start >= 3:
-                        cluster_min = negative_keys[cluster_start]
-                        cluster_max = negative_keys[i-1]
-                        # Avoid overlapping with positive key ranges
-                        if not any(p_min <= cluster_min <= p_max or p_min <= cluster_max <= p_max 
-                                  for p_min, p_max in self.positive_ranges):
-                            self.negative_ranges.append((cluster_min, cluster_max))
-                    cluster_start = i
-            
-            # Process the last cluster
-            if len(negative_keys) - cluster_start >= 3:
-                cluster_min = negative_keys[cluster_start]
-                cluster_max = negative_keys[-1]
-                # Avoid overlapping with positive key ranges
-                if not any(p_min <= cluster_min <= p_max or p_min <= cluster_max <= p_max 
-                          for p_min, p_max in self.positive_ranges):
-                    self.negative_ranges.append((cluster_min, cluster_max))
+                    # Add distance to min and max
+                    dist_to_min = abs(key_float - min_key)
+                    dist_to_max = abs(key_float - max_key)
+                    feature_vector.append(dist_to_min)
+                    feature_vector.append(dist_to_max)
                     
-        # Find positive ranges (clusters of keys)
-        if len(positive_keys) > 10:
-            positive_keys.sort()
-            start_idx = 0
-            for i in range(1, len(positive_keys)):
-                if positive_keys[i] - positive_keys[i-1] > 0.2:  # Reasonable threshold
-                    if i - start_idx > 10:  # Only use large clusters
-                        cluster_min = positive_keys[start_idx] - 0.1
-                        cluster_max = positive_keys[i-1] + 0.1
-                        self.positive_ranges.append((cluster_min, cluster_max))
-                    start_idx = i
-                    
-            # Last cluster
-            if len(positive_keys) - start_idx > 10:
-                cluster_min = positive_keys[start_idx] - 0.1
-                cluster_max = positive_keys[-1] + 0.1
-                self.positive_ranges.append((cluster_min, cluster_max))
-        
-        # Test accuracy on training data - for metrics only
-        for key, exists in zip(keys, exists):
-            pred = self.predict(key) >= 0.5  # Use normal threshold
-            if exists and pred:
-                self.true_positives += 1
-            elif exists and not pred:
-                self.false_negatives += 1
-            elif not exists and pred:
-                self.false_positives += 1
-            else:  # not exists and not pred
-                self.true_negatives += 1
+                    # Is key within level range?
+                    in_range = 1.0 if min_key <= key_float <= max_key else 0.0
+                    feature_vector.append(in_range)
+            
+            features.append(feature_vector)
+            
+        return features
     
     def predict(self, key):
-        """Predict if key exists - balancing false positives vs filtering"""
-        # If not trained, return midpoint probability
-        if not self.is_trained:
-            return 0.5
-            
-        # Quick min/max check - use more aggressive filtering
-        if key < self.min_key - 0.5 or key > self.max_key + 0.5:
-            return 0.05  # Far outside range - very unlikely (more aggressive)
-            
-        # Exact match check
-        if key in self.example_keys:
-            return 0.98  # Almost certainly exists
-            
-        # Check positive ranges
-        for min_k, max_k in self.positive_ranges:
-            if min_k <= key <= max_k:
-                return 0.9  # Likely exists
-                
-        # Check negative ranges - most important for filtering!
-        for min_k, max_k in self.negative_ranges:
-            if min_k <= key <= max_k:
-                return 0.05  # Very unlikely to exist (more aggressive)
-                
-        # Hash bucket check
-        bucket = hash(key) % self.buckets
-        if bucket in self.hash_ranges:
-            closest = min(self.hash_ranges[bucket], key=lambda x: abs(x - key), default=None)
-            if closest is not None:
-                dist = abs(closest - key)
-                if dist < 0.1:
-                    return 0.8  # Close to known key
-                elif dist < 1.0:
-                    return 0.6  # Somewhat close
+        """Predict which single level most likely contains the key.
         
-        # Important: Use a scaled probability based on distance to known keys
-        # This helps the filter actually skip runs for keys that are far from any known key
-        if self.min_key <= key <= self.max_key:
-            # For keys within range but not in specific buckets, use lower probability
-            return 0.25  # Well below the 0.3 threshold (more aggressive)
-        else:
-            # For keys outside the range, scale based on distance
-            distance = min(abs(key - self.min_key), abs(key - self.max_key))
-            range_size = self.max_key - self.min_key
-            if range_size > 0:
-                normalized_distance = min(distance / range_size, 1.0)
-                return 0.25 - normalized_distance * 0.2  # Scale from 0.25 down to 0.05
-            else:
-                return 0.15  # Default for degenerate case
-
-    def predict_bloom_batch(self, keys):
-        """Batch predict for multiple keys at once.
-        
-        Parameters:
-        -----------
-        keys : numpy.ndarray
-            Array of keys to predict
-            
         Returns:
         --------
-        numpy.ndarray
-            Array of prediction scores for each key
+        int: The predicted level number, or -1 if key doesn't exist in any level
         """
-        import numpy as np
-        results = np.empty(len(keys), dtype=np.float32)
+        if not self.trained or not self.model:
+            # Default conservative behavior - check level 0
+            return 0
         
-        # If not trained, return midpoint probability for all keys
-        if not self.is_trained:
-            results.fill(0.5)
-            return results
+        # Create features for prediction
+        X = self._create_features([key])
         
-        # Use Numba-optimized prediction if available
-        if NUMBA_AVAILABLE:
-            # Convert example keys to numpy array
-            example_keys_array = np.array(list(self.example_keys), dtype=np.float64)
-            
-            # Convert positive ranges to numpy array
-            positive_ranges = np.array(self.positive_ranges, dtype=np.float64) if self.positive_ranges else np.zeros((0, 2), dtype=np.float64)
-            
-            # Convert negative ranges to numpy array
-            negative_ranges = np.array(self.negative_ranges, dtype=np.float64) if self.negative_ranges else np.zeros((0, 2), dtype=np.float64)
-            
-            return predict_bloom_numba(keys, self.min_key, self.max_key, example_keys_array, positive_ranges, negative_ranges)
-        
-        # Fall back to pure Python implementation if Numba is not available
-        for i, key in enumerate(keys):
-            # Quick min/max check - use more aggressive filtering
-            if key < self.min_key - 0.5 or key > self.max_key + 0.5:
-                results[i] = 0.05  # Far outside range - very unlikely (more aggressive)
-                continue
-                
-            # Exact match check
-            if key in self.example_keys:
-                results[i] = 0.98  # Almost certainly exists
-                continue
-                
-            # Check positive ranges
-            in_positive_range = False
-            for min_k, max_k in self.positive_ranges:
-                if min_k <= key <= max_k:
-                    results[i] = 0.9  # Likely exists
-                    in_positive_range = True
-                    break
-            
-            if in_positive_range:
-                continue
-                
-            # Check negative ranges - most important for filtering!
-            in_negative_range = False
-            for min_k, max_k in self.negative_ranges:
-                if min_k <= key <= max_k:
-                    results[i] = 0.05  # Very unlikely to exist (more aggressive)
-                    in_negative_range = True
-                    break
-            
-            if in_negative_range:
-                continue
-                
-            # Hash bucket check
-            bucket = hash(key) % self.buckets
-            if bucket in self.hash_ranges:
-                closest = min(self.hash_ranges[bucket], key=lambda x: abs(x - key), default=None)
-                if closest is not None:
-                    dist = abs(closest - key)
-                    if dist < 0.1:
-                        results[i] = 0.8  # Close to known key
-                        continue
-                    elif dist < 1.0:
-                        results[i] = 0.6  # Somewhat close
-                        continue
-            
-            # Important: Use a scaled probability based on distance to known keys
-            if self.min_key <= key <= self.max_key:
-                # For keys within range but not in specific buckets, use lower probability
-                results[i] = 0.25  # Well below the 0.3 threshold (more aggressive)
-            else:
-                # For keys outside the range, scale based on distance
-                distance = min(abs(key - self.min_key), abs(key - self.max_key))
-                range_size = self.max_key - self.min_key
-                if range_size > 0:
-                    normalized_distance = min(distance / range_size, 1.0)
-                    results[i] = 0.25 - normalized_distance * 0.2  # Scale from 0.25 down to 0.05
-                else:
-                    results[i] = 0.15  # Default for degenerate case
-        
-        return results
+        try:
+            # Predict exactly one level
+            predicted_level = int(self.model.predict(X)[0])
+            return predicted_level
+        except Exception as e:
+            # On error, default to conservative behavior
+            print(f"Error in level prediction: {e}")
+            return 0  # Default to checking level 0
 
 class FastFencePointer:
-    """Ultra-fast fence pointer approximation"""
+    """Fast ML-based fence pointer predictor.
+    
+    This model predicts which page in a run likely contains a key,
+    allowing us to directly check the most probable page first.
+    """
+    
     def __init__(self):
-        self.key_to_page = {}  # Cache of exact key->page mappings
-        self.level_data = {}   # Per-level data
-        self.cache_hits = 0
-        self.cache_misses = 0
+        # Regression model for predicting page numbers
+        self.model = None
+        self.trained = False
+        self.accuracy = 0.0
+        self.page_counts = {}  # Track page counts per level
+        self.exact_hits = 0
+        self.total_predictions = 0
+        self.near_hits = 0  # Within ±1 page
         
-    def train(self, keys, levels, pages):
-        """Train the fast fence pointer"""
-        # Store mappings by level
-        for key, level, page in zip(keys, levels, pages):
-            if level not in self.level_data:
-                self.level_data[level] = {
-                    'min_key': float('inf'),
-                    'max_key': float('-inf'),
-                    'key_ranges': [],  # (start_key, end_key, page) tuples
-                    'examples': {},    # Sample key->page mappings
-                    'page_count': 0    # Maximum page count seen
-                }
-                
-            # Update level stats
-            level_info = self.level_data[level]
-            level_info['min_key'] = min(level_info['min_key'], key)
-            level_info['max_key'] = max(level_info['max_key'], key)
-            level_info['page_count'] = max(level_info['page_count'], page + 1)
+    def train(self, X, y):
+        """Train the fence pointer model on X features and y labels.
+        
+        X should include [key, level]
+        y should be the page_id
+        """
+        from sklearn.ensemble import RandomForestRegressor
+        from sklearn.model_selection import train_test_split
+        import numpy as np
+        import time
+        
+        if len(X) == 0 or len(y) == 0:
+            print("Error: No training data provided")
+            return False
             
-            # Store example mappings (limited to avoid memory issues)
-            if len(level_info['examples']) < 1000:
-                level_info['examples'][key] = page
-                
-            # Store in global cache too (limited)
-            if len(self.key_to_page) < 10000:
-                self.key_to_page[(key, level)] = page
-                
-        # Build key ranges for each level
-        for level, level_info in self.level_data.items():
-            # Get keys and pages for this level
-            level_keys = []
-            level_pages = []
-            for (k, l), p in self.key_to_page.items():
-                if l == level:
-                    level_keys.append(k)
-                    level_pages.append(p)
-                    
-            # Sort by key
-            key_page_pairs = sorted(zip(level_keys, level_pages))
+        # Convert inputs to numpy arrays if they aren't already
+        X = np.array(X)
+        y = np.array(y)
             
-            # Build ranges
-            if len(key_page_pairs) > 0:
-                current_page = key_page_pairs[0][1]
-                range_start = key_page_pairs[0][0]
+        # Extract levels and page counts
+        levels = np.array([x[1] for x in X])
+        unique_levels = np.unique(levels)
+        
+        # Calculate page counts per level
+        for level in unique_levels:
+            level_indices = np.where(levels == level)[0]
+            level_pages = np.array([y[i] for i in level_indices])
+            self.page_counts[int(level)] = int(np.max(level_pages) + 1)  # +1 because 0-indexed
+            
+        # Split data for training and validation
+        X_train, X_val, y_train, y_val = train_test_split(X, y, test_size=0.2, random_state=42)
+        
+        print(f"Training fence pointer with {len(X_train)} samples, validating with {len(X_val)} samples")
+        
+        start_time = time.time()
+        
+        # Train a more powerful random forest model for fence pointers
+        self.model = RandomForestRegressor(
+            n_estimators=100,     # Number of trees
+            max_depth=10,         # Deeper trees
+            random_state=42,
+            n_jobs=-1             # Use all cores
+        )
+        self.model.fit(X_train, y_train)
+        
+        end_time = time.time()
+        training_time_ms = (end_time - start_time) * 1000
+        
+        # Evaluate on validation set
+        self.trained = True
+        y_pred = self.model.predict(X_val)
+        
+        # Calculate accuracy metrics - fence pointers need to predict exact page
+        exact_matches = 0
+        near_matches = 0  # Within ±1 page
+        
+        for i in range(len(y_val)):
+            true_page = int(y_val[i])
+            pred_page = int(round(y_pred[i]))
+            
+            if true_page == pred_page:
+                exact_matches += 1
                 
-                for key, page in key_page_pairs[1:]:
-                    if page != current_page:
-                        # End of range
-                        level_info['key_ranges'].append((range_start, key, current_page))
-                        range_start = key
-                        current_page = page
-                        
-                # Add last range
-                level_info['key_ranges'].append((range_start, level_info['max_key'], current_page))
+            if abs(true_page - pred_page) <= 1:
+                near_matches += 1
+                
+        # Calculate accuracies
+        self.exact_hits = exact_matches
+        self.total_predictions = len(y_val)
+        self.near_hits = near_matches
+        
+        exact_accuracy = exact_matches / len(y_val) if len(y_val) > 0 else 0
+        near_accuracy = near_matches / len(y_val) if len(y_val) > 0 else 0
+        
+        self.accuracy = near_accuracy  # We consider near matches to be accurate enough
+        
+        print(f"Fence pointer trained in {training_time_ms:.2f}ms")
+        print(f"Fence pointer accuracy: exact={exact_accuracy:.2%}, near={near_accuracy:.2%}")
+        
+        return True
     
     def predict(self, key, level):
-        """Predict page for key - extremely fast approximation"""
-        # Check direct cache first
-        if (key, level) in self.key_to_page:
-            self.cache_hits += 1
-            return self.key_to_page[(key, level)]
+        """Predict which page in a run likely contains the key."""
+        if not self.trained or not self.model:
+            # Default to page 0 if not trained
+            return 0
             
-        self.cache_misses += 1
+        # Format key and level for model input
+        X = self._format_input(key, level)
         
-        # Check if level exists
-        if level not in self.level_data:
-            return 0  # Default to first page
+        # Get prediction
+        try:
+            # Predict and round to nearest integer
+            page = int(round(self.model.predict([X])[0]))
             
-        level_info = self.level_data[level]
-        
-        # Check bounds
-        if key < level_info['min_key']:
-            return 0  # Before first page
-        if key > level_info['max_key']:
-            return level_info['page_count'] - 1  # After last page
+            # Ensure prediction is within bounds
+            if level in self.page_counts:
+                max_page = self.page_counts[level] - 1
+                page = max(0, min(page, max_page))
+                
+            return page
             
-        # Check examples for exact match
-        if key in level_info['examples']:
-            # Add to cache
-            self.key_to_page[(key, level)] = level_info['examples'][key]
-            return level_info['examples'][key]
+        except Exception as e:
+            # On error, default to page 0
+            print(f"Error in fence prediction: {e}")
+            return 0
             
-        # Check example for nearest match
-        if level_info['examples']:
-            nearest = min(level_info['examples'].keys(), key=lambda k: abs(k - key))
-            if abs(nearest - key) < 0.1:  # Very close key
-                page = level_info['examples'][nearest]
-                # Add to cache
-                self.key_to_page[(key, level)] = page
-                return page
+    def _format_input(self, key, level):
+        """Format input for model prediction."""
+        if isinstance(key, bytes):
+            import struct
+            try:
+                # Convert bytes to float
+                key = struct.unpack('!d', key[:8])[0]
+            except:
+                # On error, return a default value
+                return [0.0, level]
                 
-        # Check ranges
-        for start_key, end_key, page in level_info['key_ranges']:
-            if start_key <= key <= end_key:
-                # Add to cache
-                self.key_to_page[(key, level)] = page
-                return page
-                
-        # Approximate with linear interpolation
-        key_range = level_info['max_key'] - level_info['min_key']
-        if key_range > 0:
-            normalized_pos = (key - level_info['min_key']) / key_range
-            predicted_page = int(normalized_pos * level_info['page_count'])
-            result = max(0, min(level_info['page_count'] - 1, predicted_page))
-            # Add to cache
-            self.key_to_page[(key, level)] = result
-            return result
-        
-        return 0  # Default to first page
-
-    def predict_fence_batch(self, keys, level):
-        """Batch predict pages for multiple keys at once.
-        
-        Parameters:
-        -----------
-        keys : numpy.ndarray
-            Array of keys to predict
-        level : int
-            Level number
-            
-        Returns:
-        --------
-        numpy.ndarray
-            Array of predicted page numbers for each key
-        """
-        import numpy as np
-        results = np.empty(len(keys), dtype=np.int32)
-        
-        # Check if level exists
-        if level not in self.level_data:
-            results.fill(0)  # Default to first page
-            return results
-            
-        level_info = self.level_data[level]
-        
-        # Use Numba-optimized prediction if available
-        if NUMBA_AVAILABLE and len(keys) > 10:  # Only use Numba for larger batches
-            # Convert example keys and pages to numpy arrays
-            example_keys = np.array(list(level_info['examples'].keys()), dtype=np.float64)
-            example_pages = np.array([level_info['examples'][k] for k in example_keys], dtype=np.int32)
-            
-            # Convert key ranges to numpy array (start_key, end_key, page)
-            key_ranges = np.zeros((len(level_info['key_ranges']), 3), dtype=np.float64)
-            for i, (start_key, end_key, page) in enumerate(level_info['key_ranges']):
-                key_ranges[i, 0] = start_key
-                key_ranges[i, 1] = end_key
-                key_ranges[i, 2] = page
-                
-            return predict_fence_numba(
-                keys, 
-                level_info['min_key'], 
-                level_info['max_key'],
-                level_info['page_count'],
-                example_keys,
-                example_pages,
-                key_ranges
-            )
-            
-        # Fall back to pure Python implementation
-        for i, key in enumerate(keys):
-            # Check direct cache first
-            if (key, level) in self.key_to_page:
-                self.cache_hits += 1
-                results[i] = self.key_to_page[(key, level)]
-                continue
-                
-            self.cache_misses += 1
-            
-            # Check bounds
-            if key < level_info['min_key']:
-                results[i] = 0  # First page
-                continue
-                
-            if key > level_info['max_key']:
-                results[i] = level_info['page_count'] - 1  # Last page
-                continue
-                
-            # Check examples for exact match
-            if key in level_info['examples']:
-                # Add to cache
-                self.key_to_page[(key, level)] = level_info['examples'][key]
-                results[i] = level_info['examples'][key]
-                continue
-                
-            # Check example for nearest match
-            if level_info['examples']:
-                nearest = min(level_info['examples'].keys(), key=lambda k: abs(k - key))
-                if abs(nearest - key) < 0.1:  # Very close key
-                    page = level_info['examples'][nearest]
-                    # Add to cache
-                    self.key_to_page[(key, level)] = page
-                    results[i] = page
-                    continue
-                    
-            # Check ranges
-            range_found = False
-            for start_key, end_key, page in level_info['key_ranges']:
-                if start_key <= key <= end_key:
-                    # Add to cache
-                    self.key_to_page[(key, level)] = page
-                    results[i] = page
-                    range_found = True
-                    break
-                    
-            if range_found:
-                continue
-                
-            # Approximate with linear interpolation
-            key_range = level_info['max_key'] - level_info['min_key']
-            if key_range > 0:
-                normalized_pos = (key - level_info['min_key']) / key_range
-                predicted_page = int(normalized_pos * level_info['page_count'])
-                result = max(0, min(level_info['page_count'] - 1, predicted_page))
-                # Add to cache
-                self.key_to_page[(key, level)] = result
-                results[i] = result
-            else:
-                results[i] = 0  # Default to first page
-        
-        return results
+        # Return feature vector [key, level]
+        return [float(key), int(level)]
 
 class LSMMLModels:
     """Manager class for LSM tree ML models."""
@@ -733,8 +535,8 @@ class LSMMLModels:
         
     def _load_models(self):
         """Load existing models if available."""
-        bloom_path = os.path.join(self.models_dir, "fast_bloom.pkl")
-        fence_path = os.path.join(self.models_dir, "fast_fence.pkl")
+        bloom_path = os.path.join(self.models_dir, "bloom_model.pkl")
+        fence_path = os.path.join(self.models_dir, "fence_model.pkl")
         
         if os.path.exists(bloom_path):
             try:
@@ -752,8 +554,8 @@ class LSMMLModels:
             
     def _save_models(self):
         """Save models to disk."""
-        bloom_path = os.path.join(self.models_dir, "fast_bloom.pkl")
-        fence_path = os.path.join(self.models_dir, "fast_fence.pkl")
+        bloom_path = os.path.join(self.models_dir, "bloom_model.pkl")
+        fence_path = os.path.join(self.models_dir, "fence_model.pkl")
         
         try:
             with open(bloom_path, 'wb') as f:
@@ -764,9 +566,14 @@ class LSMMLModels:
         except:
             pass
         
-    def add_bloom_training_data(self, key: float, exists: bool):
-        """Add training data for Bloom filter model."""
-        self.bloom_data.append((key, exists))
+    def add_bloom_training_data(self, key: float, level: int):
+        """Add training data for Bloom filter model.
+        
+        Instead of True/False, we now use the level number:
+        - Level 0, 1, 2, 3, etc: The key exists in this specific level
+        - Level -1: The key doesn't exist in any level
+        """
+        self.bloom_data.append((key, level))
         # Clear cache when new data is added
         self.bloom_cache = {}
         
@@ -777,41 +584,67 @@ class LSMMLModels:
         self.fence_cache = {}
         
     def train_bloom_model(self):
-        """Train Bloom filter model."""
+        """Train Bloom filter model to predict which level contains a key."""
         if not self.bloom_data:
             return
             
         start_time = time.perf_counter()
             
-        # Extract keys and labels
+        # Extract keys and levels
         keys = [key for key, _ in self.bloom_data]
-        exists = [e for _, e in self.bloom_data]
+        levels = [level for _, level in self.bloom_data]
         
-        # Train the fast model
-        self.bloom_model.train(keys, exists)
+        # Balance the dataset - get counts per level
+        level_counts = Counter(levels)
+        print(f"Original level distribution: {dict(level_counts)}")
         
-        # Calculate accuracy - focus on sensitivity (avoiding false negatives)
-        # Formula: sensitivity = TP / (TP + FN)
-        true_positives = self.bloom_model.true_positives
-        false_negatives = self.bloom_model.false_negatives
-        false_positives = self.bloom_model.false_positives
-        true_negatives = self.bloom_model.true_negatives
+        # Calculate class weights for training
+        class_weights = {}
+        total_samples = len(levels)
+        num_classes = len(level_counts)
         
-        # Calculate sensitivity (recall) - avoiding false negatives is crucial
-        sensitivity = true_positives / (true_positives + false_negatives) if (true_positives + false_negatives) > 0 else 1.0
+        for level, count in level_counts.items():
+            # Inverse frequency weighting
+            class_weights[level] = total_samples / (num_classes * count)
         
-        # Calculate general accuracy
-        total = true_positives + false_negatives + false_positives + true_negatives
-        general_accuracy = (true_positives + true_negatives) / total if total > 0 else 1.0
+        print(f"Using class weights: {class_weights}")
         
-        # For bloom filters, we care more about sensitivity than general accuracy
-        self.bloom_accuracy = sensitivity
+        # Create balanced sample for improved training
+        balanced_keys = []
+        balanced_levels = []
+        
+        # Find the minimum count for balancing (use at least 20000 samples per class)
+        target_count = max(20000, min(level_counts.values()))
+        
+        # Create undersampled training data for majority classes, 
+        # and oversampled data for minority classes
+        for level in level_counts:
+            # Get indices for this level
+            level_indices = [i for i, l in enumerate(levels) if l == level]
+            
+            if len(level_indices) > target_count:
+                # Undersample for majority classes
+                sampled_indices = random.sample(level_indices, target_count)
+            else:
+                # Oversample for minority classes
+                sampled_indices = random.choices(level_indices, k=target_count)
+                
+            # Add sampled data
+            for idx in sampled_indices:
+                balanced_keys.append(keys[idx])
+                balanced_levels.append(levels[idx])
+                
+        print(f"Rebalanced dataset: {len(balanced_keys)} samples")
+        
+        # Train the model with balanced data
+        self.bloom_model.train(balanced_keys, balanced_levels)
+        
+        # Get accuracy from the model
+        self.bloom_accuracy = self.bloom_model.accuracy
         
         end_time = time.perf_counter()
-        print(f"Fast bloom model trained in {(end_time - start_time)*1000:.2f}ms")
-        print(f"Bloom filter sensitivity: {sensitivity:.2%} (avoiding false negatives)")
-        print(f"Bloom filter general accuracy: {general_accuracy:.2%}")
-        print(f"Bloom stats - TP: {true_positives}, FN: {false_negatives}, FP: {false_positives}, TN: {true_negatives}")
+        print(f"Level predictor trained in {(end_time - start_time)*1000:.2f}ms")
+        print(f"Level prediction accuracy: {self.bloom_accuracy:.2%}")
         
         # Clear cache
         self.bloom_cache = {}
@@ -825,77 +658,45 @@ class LSMMLModels:
             
         start_time = time.perf_counter()
         
-        # Extract data
-        keys = [key for key, _, _ in self.fence_data]
-        levels = [level for _, level, _ in self.fence_data]
-        pages = [page for _, _, page in self.fence_data]
+        # Extract X (key, level) and y (page)
+        X = []
+        y = []
         
-        # Train the fast model
-        self.fence_model.train(keys, levels, pages)
+        for key, level, page in self.fence_data:
+            X.append([float(key), int(level)])  # Input features: key and level
+            y.append(int(page))                # Target: page number
         
-        # Calculate accuracy 
-        correct = 0
-        total = 0
-        errors = []
-        for key, level, page in self.fence_data[-1000:]:  # Check last 1000 samples for speed
-            pred = self.fence_model.predict(key, level)
-            errors.append(abs(pred - page))
-            if pred == page:  # Exact match
-                correct += 1
-            total += 1
-            
-        # Exact accuracy
-        exact_accuracy = correct / total if total > 0 else 1.0
+        # Train the model with the correct function signature
+        self.fence_model.train(X, y)
         
-        # Mean absolute error based accuracy
-        if total > 0:
-            mae = sum(errors) / total
-            max_page = max(pages) if pages else 1
-            self.fence_accuracy = 1.0 - (mae / max_page) if max_page > 0 else 1.0
-        else:
-            self.fence_accuracy = 1.0
-            
+        # Get accuracy
+        self.fence_accuracy = self.fence_model.accuracy
+        
         end_time = time.perf_counter()
-        print(f"Fast fence model trained in {(end_time - start_time)*1000:.2f}ms with {exact_accuracy:.2%} exact accuracy, {self.fence_accuracy:.2%} overall accuracy")
+        training_time = (end_time - start_time) * 1000
+        
+        print(f"Fence pointer model training completed in {training_time/1000:.2f} seconds")
         
         # Clear cache
         self.fence_cache = {}
         
         self._save_models()
         
-    def predict_bloom(self, key: float) -> float:
-        """Predict if a key exists using Bloom filter model."""
-        # Ultra-fast path: Check cache first
+    def predict_bloom(self, key: float) -> int:
+        """Predict which level most likely contains the key.
+        
+        Returns:
+        --------
+        int: The predicted level number, or -1 if the key likely doesn't exist
+        """
+        # Check cache first
         if key in self.bloom_cache:
             return self.bloom_cache[key]
         
         # Time the prediction
         start_time = time.perf_counter()
         
-        # OPTIMIZATION: For extreme speed, use faster range checks before model
-        # Outside range checks
-        if key < self.bloom_model.min_key - 0.5 or key > self.bloom_model.max_key + 0.5:
-            result = 0.1  # Very unlikely to exist
-            self.bloom_cache[key] = result
-            
-            # Record timing
-            end_time = time.perf_counter()
-            self.bloom_prediction_time += (end_time - start_time)
-            self.bloom_prediction_count += 1
-            return result
-        
-        # Exact match in example keys - extremely fast
-        if key in self.bloom_model.example_keys:
-            result = 0.95  # Almost certainly exists
-            self.bloom_cache[key] = result
-            
-            # Record timing
-            end_time = time.perf_counter()
-            self.bloom_prediction_time += (end_time - start_time)
-            self.bloom_prediction_count += 1
-            return result
-        
-        # Full bloom model prediction
+        # Get prediction from the model
         result = self.bloom_model.predict(key)
         
         # Store in cache
@@ -1069,4 +870,62 @@ class LSMMLModels:
             'fence_direct_cache_hits': getattr(self.fence_model, 'cache_hits', 0),
             'fence_direct_cache_misses': getattr(self.fence_model, 'cache_misses', 0)
         }
-        return stats 
+        return stats
+
+    def save_models(self):
+        """Save trained models to disk."""
+        import pickle
+        import os
+        
+        # Create directory if it doesn't exist
+        if not os.path.exists(self.models_dir):
+            os.makedirs(self.models_dir, exist_ok=True)
+            
+        # Save bloom filter model
+        bloom_path = os.path.join(self.models_dir, "bloom_model.pkl")
+        with open(bloom_path, 'wb') as f:
+            pickle.dump(self.bloom_model, f)
+            
+        # Save fence pointer model
+        fence_path = os.path.join(self.models_dir, "fence_model.pkl") 
+        with open(fence_path, 'wb') as f:
+            pickle.dump(self.fence_model, f)
+            
+        # Save training data for potential retraining
+        data_path = os.path.join(self.models_dir, "training_data.pkl")
+        with open(data_path, 'wb') as f:
+            pickle.dump({
+                'bloom_data': self.bloom_data,
+                'fence_data': self.fence_data,
+                'bloom_accuracy': self.bloom_accuracy,
+                'fence_accuracy': self.fence_accuracy
+            }, f)
+            
+        print(f"Models and training data saved to {self.models_dir}")
+        
+    def load_models(self):
+        """Load trained models from disk."""
+        import pickle
+        import os
+        
+        # Load bloom filter model
+        bloom_path = os.path.join(self.models_dir, "bloom_model.pkl")
+        if os.path.exists(bloom_path):
+            with open(bloom_path, 'rb') as f:
+                self.bloom_model = pickle.load(f)
+                
+        # Load fence pointer model
+        fence_path = os.path.join(self.models_dir, "fence_model.pkl")
+        if os.path.exists(fence_path):
+            with open(fence_path, 'rb') as f:
+                self.fence_model = pickle.load(f)
+                
+        # Load training statistics if available
+        data_path = os.path.join(self.models_dir, "training_data.pkl")
+        if os.path.exists(data_path):
+            with open(data_path, 'rb') as f:
+                data = pickle.load(f)
+                self.bloom_accuracy = data.get('bloom_accuracy', 0)
+                self.fence_accuracy = data.get('fence_accuracy', 0)
+                
+        print(f"Models loaded from {self.models_dir}") 
