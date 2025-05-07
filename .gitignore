@@ -1,0 +1,6 @@
+.DS_Store
+data/
+__pycache__/
+*.pyc
+.venv/
+python-implementation/learned_test_data/
