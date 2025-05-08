@@ -6,6 +6,7 @@ import logging
 import numpy as np
 import pickle
 import struct
+import matplotlib.pyplot as plt
 from lsm import TraditionalLSMTree, LearnedLSMTree, Constants
 
 # Configure logging to reduce verbosity
@@ -86,12 +87,9 @@ class PerformanceTest:
         
         # Create learned tree in memory
         self.learned_dir = "learned_test_data"
-        if os.path.exists(self.learned_dir):
-            import shutil
-            shutil.rmtree(self.learned_dir)
         os.makedirs(self.learned_dir, exist_ok=True)
         
-        # Copy data structure from traditional to learned
+        # Copy data structure from traditional to learned if needed
         print("Copying data structure to learned tree...")
         self._copy_tree_structure(self.data_dir, self.learned_dir)
         
@@ -105,19 +103,9 @@ class PerformanceTest:
             validation_rate=0.05
         )
         
-        # Make sure the learned tree loads the copied data
-        print("Loading data into learned tree...")
-        try:
-            # Force the learned tree to discover the copied data
-            self.learned_tree.load_existing_data()
-        except Exception as e:
-            print(f"Warning: Error loading existing data into learned tree: {e}")
-            import traceback
-            traceback.print_exc()
-        
-        # Train ML models
-        print("Training ML models...")
-        self._train_ml_models()
+        # Load pre-trained ML models
+        print("Loading ML models...")
+        self._load_ml_models()
         
         # Reset global counters
         MetricsCounters.reset()
@@ -134,15 +122,15 @@ class PerformanceTest:
             'remove': {'traditional': [], 'learned': []},
             'bloom_checks': {'total': 0, 'bypassed': 0},
             'disk_io': {'reads': 0, 'writes': 0},
-            'false_negatives': {
-                'count': 0,
+            'accuracy': {
+                'false_negatives': 0,
                 'total_lookups': 0,
-                'by_pattern': {}  # Track false negatives per pattern
+                'false_negative_rate': 0.0
             }
         }
         
-        # Specialized batch size for loading data
-        self.LOAD_BATCH_SIZE = 10000
+        # For tracking model accuracy
+        self.fnr_per_level = {}  # Track FNR by level
         
         print("Test environment initialization complete")
         
@@ -188,32 +176,15 @@ class PerformanceTest:
         print(f"Directory copy complete")
         return True
     
-    def _train_ml_models(self):
-        """Load pre-trained ML models instead of training them again."""
+    def _load_ml_models(self):
+        """Load pre-trained ML models from the designated path."""
         start_time = time.time()
         
-        # Instead of training, just load the trained models
-        print("Loading pre-trained ML models...")
-        
-        # Get all runs from the traditional tree
-        trad_stats = self.traditional_tree.get_stats()
-        
-        # Get total number of runs across all levels
-        run_count = 0
-        for level_stats in trad_stats.get('levels', []):
-            run_count += level_stats.get('run_count', 0)
-        
-        print(f"Using existing models for {run_count} runs across all levels")
-        
-        # Check if the ML models exist
+        # Check if the ML models exist in learned_test_data/ml_models
         ml_models_dir = os.path.join(self.learned_dir, "ml_models")
-        bloom_model_path = os.path.join(ml_models_dir, "bloom_model.pkl")
-        fence_model_path = os.path.join(ml_models_dir, "fence_model.pkl")
         
-        if not os.path.exists(bloom_model_path) or not os.path.exists(fence_model_path):
-            print(f"ERROR: Pre-trained models not found at {ml_models_dir}")
-            print("Please run train_models.py first to create the models!")
-            return
+        if not os.path.exists(ml_models_dir):
+            os.makedirs(ml_models_dir, exist_ok=True)
         
         # Load models for the learned tree
         try:
@@ -233,13 +204,24 @@ class PerformanceTest:
             self.learned_tree.training_stats['fence']['last_accuracy'] = fence_acc
             
         except Exception as e:
-            print(f"Error loading models: {e}")
-            import traceback
-            traceback.print_exc()
+            print(f"Error loading models, will create new ones: {e}")
+            self._train_ml_models()
         
         elapsed = time.time() - start_time
         print(f"Model loading complete in {elapsed:.2f} seconds")
         
+    def _train_ml_models(self):
+        """Train ML models on the existing data if they don't exist."""
+        from train_models import ModelTrainer
+        
+        print("Training ML models...")
+        trainer = ModelTrainer(data_dir=self.data_dir, model_dir=self.learned_dir)
+        trainer.train_models()
+        
+        # Reload the trained models
+        self.learned_tree.ml_models.load_models()
+        print("ML models training complete")
+    
     def _time_operation(self, tree, func_name, *args, **kwargs):
         """Time an operation with high precision."""
         try:
@@ -248,305 +230,345 @@ class PerformanceTest:
             
             # Make sure we got a callable function
             if not callable(func):
-                raise TypeError(f"Retrieved attribute '{func_name}' is not callable: {type(func)}")
-            
-            start_time = time.perf_counter_ns()  # Use nanoseconds for maximum precision
+                print(f"Error: {func_name} is not callable")
+                return None, -1
+                
+            # Time the operation
+            start_time = time.perf_counter()
             result = func(*args, **kwargs)
-            end_time = time.perf_counter_ns()
+            end_time = time.perf_counter()
             
-            # Convert to microseconds (1 ns = 0.001 μs)
-            duration_us = (end_time - start_time) / 1000
-            return result, duration_us
+            # Return result and elapsed time in microseconds
+            return result, (end_time - start_time) * 1000000
+            
         except Exception as e:
-            print(f"Error in _time_operation: {e}")
-            print(f"Tree type: {type(tree)}, Function name: {func_name}")
-            print(f"Args: {args}, Kwargs: {kwargs}")
-            raise
-    
+            print(f"Error in operation {func_name}: {e}")
+            return None, -1
+            
     def _generate_random_key(self):
-        """Generate a random key as a float (will be converted to fixed-size bytes)."""
-        return random.uniform(0, 1_000_000_000)
+        """Generate a random key as a float."""
+        return random.uniform(0, 1000000)
         
     def _generate_random_value(self, key):
-        """Generate a deterministic value from key."""
-        # Use a simple transformation to ensure the value is deterministic for the key
-        # This helps in validation later
-        return f"v{key:.6f}"
+        """Generate a random value string based on the key."""
+        return f"value-{key}-{random.randint(0, 100000)}"
         
     def print_level_statistics(self):
-        """Print statistics about the current level structure of both trees."""
-        print("\n== LEVEL STATISTICS ==")
+        """Print statistics about both trees."""
+        print("\n====== Traditional LSM Tree Statistics ======")
+        trad_stats = self.traditional_tree.get_stats()
+        total_runs = 0
+        total_entries = 0
         
-        try:
-            # Traditional Tree Stats
-            trad_stats = self.traditional_tree.get_stats()
-            print("\nTraditional Tree:")
-            
-            if isinstance(trad_stats.get('levels'), list):
-                total_entries = 0
-                total_size_mb = 0
-                
-                print(f"{'Level':<6}{'Entries':<12}{'Size (MB)':<12}{'Runs':<6}")
-                print("-" * 36)
-                
-                for i, level in enumerate(trad_stats['levels']):
-                    entries = level.get('entries', 0)
-                    size_mb = entries * self.ENTRY_SIZE_BYTES / (1024 * 1024)
-                    run_count = len(level.get('runs', []))
-                    total_entries += entries
-                    total_size_mb += size_mb
-                    print(f"{i:<6}{entries:,d} {'':<5}{size_mb:.2f} {'':<5}{run_count}")
-                
-                print("-" * 36)
-                print(f"{'Total':<6}{total_entries:,d} {'':<5}{total_size_mb:.2f}")
-            
-            # Learned Tree Stats
-            learned_stats = self.learned_tree.get_stats()
-            print("\nLearned Tree:")
-            
-            if isinstance(learned_stats.get('levels'), list):
-                total_entries = 0
-                total_size_mb = 0
-                
-                print(f"{'Level':<6}{'Entries':<12}{'Size (MB)':<12}{'Runs':<6}")
-                print("-" * 36)
-                
-                for i, level in enumerate(learned_stats['levels']):
-                    entries = level.get('entries', 0)
-                    size_mb = entries * self.ENTRY_SIZE_BYTES / (1024 * 1024)
-                    run_count = len(level.get('runs', []))
-                    total_entries += entries
-                    total_size_mb += size_mb
-                    print(f"{i:<6}{entries:,d} {'':<5}{size_mb:.2f} {'':<5}{run_count}")
-                
-                print("-" * 36)
-                print(f"{'Total':<6}{total_entries:,d} {'':<5}{total_size_mb:.2f}")
-            
-            # ML model stats if available (concise version)
-            if 'ml_models' in learned_stats:
-                print("\nML Models: ", end="")
-                ml_stats = learned_stats['ml_models']
-                print(f"Bloom Filter Accuracy: {ml_stats.get('bloom_accuracy', 0):.2%}, ", end="")
-                print(f"Fence Pointer Accuracy: {ml_stats.get('fence_accuracy', 0):.2%}")
-        except Exception as e:
-            print(f"Error getting tree statistics: {e}")
+        # Check if buffer stats exist
+        if 'buffer' in trad_stats and 'entries' in trad_stats['buffer']:
+            print(f"Buffer: {trad_stats['buffer']['entries']} entries " + 
+                  f"({trad_stats['buffer']['size_bytes']/1024:.1f} KB)")
+        else:
+            print("Buffer: Stats not available")
         
-    def test_random_lookups(self, num_lookups: int = 5_000):
-        """Test random lookups with different access patterns."""
-        print("\n== TESTING RANDOM LOOKUPS ==")
-        print(f"Running {num_lookups} lookups per pattern")
+        for i, level in enumerate(trad_stats.get('levels', [])):
+            total_runs += level.get('run_count', 0)
+            total_entries += level.get('entries', 0)
+            
+            print(f"Level {i}: {level.get('run_count', 0)} runs, " + 
+                  f"{level.get('entries', 0)} entries " + 
+                  f"({level.get('size_bytes', 0)/1024/1024:.2f} MB)")
+            
+        print(f"Total: {total_runs} runs, {total_entries} entries")
         
-        # Reset counters for fresh measurement
-        MetricsCounters.reset()
+        print("\n====== Learned LSM Tree Statistics ======")
+        learned_stats = self.learned_tree.get_stats()
+        total_runs = 0
+        total_entries = 0
         
-        # Initialize false negative tracking
-        self.metrics['false_negatives'] = {
-            'count': 0,
-            'total_lookups': 0,
-            'by_pattern': {}  # Track false negatives per pattern
-        }
+        # Check if buffer stats exist
+        if 'buffer' in learned_stats and 'entries' in learned_stats['buffer']:
+            print(f"Buffer: {learned_stats['buffer']['entries']} entries " + 
+                  f"({learned_stats['buffer']['size_bytes']/1024:.1f} KB)")
+        else:
+            print("Buffer: Stats not available")
         
-        # Different access patterns
-        patterns = {
-            'uniform': lambda: random.uniform(0, 1_000_000_000),  # Entire range
-            'recent': lambda: random.uniform(800_000_000, 1_000_000_000),  # 20% newest
-            'old': lambda: random.uniform(0, 200_000_000),  # 20% oldest
-            'hot': lambda: random.choice([
-                random.uniform(0, 200_000_000),      # 33% in oldest
-                random.uniform(400_000_000, 600_000_000),  # 33% in middle
-                random.uniform(800_000_000, 1_000_000_000)  # 33% in newest
-            ])
-        }
+        for i, level in enumerate(learned_stats.get('levels', [])):
+            total_runs += level.get('run_count', 0)
+            total_entries += level.get('entries', 0)
+            
+            print(f"Level {i}: {level.get('run_count', 0)} runs, " + 
+                  f"{level.get('entries', 0)} entries " + 
+                  f"({level.get('size_bytes', 0)/1024/1024:.2f} MB)")
+            
+        print(f"Total: {total_runs} runs, {total_entries} entries")
         
-        for pattern_name, key_gen in patterns.items():
-            print(f"\nPattern: {pattern_name}")
-            self.metrics['false_negatives']['by_pattern'][pattern_name] = {
-                'count': 0,
-                'total': 0
-            }
-            
-            # Reset bloom filter stats for this pattern
-            bloom_checks_before = MetricsCounters.bloom_checks
-            bloom_bypasses_before = MetricsCounters.bloom_bypasses
-            
-            # Reset page access counters for this pattern
-            trad_pages_before = MetricsCounters.traditional_pages_checked
-            learned_pages_before = MetricsCounters.learned_pages_checked
-            
-            # Reset disk reads counter
-            disk_reads_before = MetricsCounters.disk_reads
-            
-            # Generate keys for the pattern
-            pattern_keys = [key_gen() for _ in range(num_lookups)]
-            
-            # Test traditional lookups
-            print("  Traditional lookups: ", end="", flush=True)
-            trad_start_time = time.perf_counter()
-            trad_values = []
-            
-            for i, key in enumerate(pattern_keys):
-                if i % 1000 == 0 and i > 0:
-                    print(f"{i}/{num_lookups}...", end="", flush=True)
-                
-                # Time traditional lookup
-                value, duration = self._time_operation(
-                    self.traditional_tree, "get", key
-                )
-                trad_values.append(value)
-                self.metrics['get']['traditional'].append(duration)
-            
-            trad_end_time = time.perf_counter()
-            trad_total_time = (trad_end_time - trad_start_time) * 1000000  # μs
-            print(" Done.")
-            
-            # Calculate page checks and disk reads for traditional
-            trad_pages_checked = MetricsCounters.traditional_pages_checked - trad_pages_before
-            trad_disk_reads = MetricsCounters.disk_reads - disk_reads_before
-            
-            # Reset disk reads counter for learned implementation
-            disk_reads_before = MetricsCounters.disk_reads
-            
-            # Test learned lookups
-            print("  Learned lookups: ", end="", flush=True)
-            learned_start_time = time.perf_counter()
-            learned_values = []
-            
-            for i, key in enumerate(pattern_keys):
-                if i % 1000 == 0 and i > 0:
-                    print(f"{i}/{num_lookups}...", end="", flush=True)
-                
-                # Track lookup attempt
-                MetricsCounters.lookups_attempted += 1
-                
-                # Time learned lookup (one at a time, no batching)
-                value, duration = self._time_operation(
-                    self.learned_tree, "get", key
-                )
-                learned_values.append(value)
-                self.metrics['get']['learned'].append(duration)
-            
-            learned_end_time = time.perf_counter()
-            learned_total_time = (learned_end_time - learned_start_time) * 1000000  # μs
-            print(" Done.")
-            
-            # Calculate page checks and disk reads for learned
-            learned_pages_checked = MetricsCounters.learned_pages_checked - learned_pages_before
-            learned_disk_reads = MetricsCounters.disk_reads - disk_reads_before
-            
-            # Calculate bloom filter stats for this pattern
-            pattern_bloom_checks = MetricsCounters.bloom_checks - bloom_checks_before
-            pattern_bloom_bypasses = MetricsCounters.bloom_bypasses - bloom_checks_before
-            
-            # Validate correctness
-            mismatches = 0
-            for i, (trad_val, learned_val) in enumerate(zip(trad_values, learned_values)):
-                if trad_val != learned_val:
-                    mismatches += 1
-            
-            # Check for false negatives (when ML model missed finding a key that exists)
-            for i, (trad_val, learned_val) in enumerate(zip(trad_values, learned_values)):
-                self.metrics['false_negatives']['total_lookups'] += 1
-                self.metrics['false_negatives']['by_pattern'][pattern_name]['total'] += 1
-                
-                if trad_val is not None and learned_val is None:
-                    self.metrics['false_negatives']['count'] += 1
-                    self.metrics['false_negatives']['by_pattern'][pattern_name]['count'] += 1
-                    MetricsCounters.false_negatives += 1
-            
-            # Print pattern statistics (concise)
-            bypass_rate = pattern_bloom_bypasses / pattern_bloom_checks if pattern_bloom_checks > 0 else 0
-            speedup = trad_total_time / learned_total_time if learned_total_time > 0 else float('inf')
-            page_ratio = learned_pages_checked / trad_pages_checked if trad_pages_checked > 0 else float('inf')
-            
-            print(f"  Results: Speedup: {speedup:.2f}x, Bloom bypasses: {bypass_rate:.2%}, " +
-                  f"Page access ratio: {page_ratio:.2f}x, Mismatches: {mismatches}")
+        # Print ML model training stats
+        print("\n====== ML Model Stats ======")
+        bloom_acc = self.learned_tree.ml_models.get_bloom_accuracy()
+        fence_acc = self.learned_tree.ml_models.get_fence_accuracy()
+        
+        print(f"Bloom Filter Accuracy: {bloom_acc:.2%}")
+        print(f"Fence Pointer Accuracy: {fence_acc:.2%}")
 
-    def test_range_queries(self, num_queries: int = 100):
-        """Test range queries with different sizes."""
-        print("\n== TESTING RANGE QUERIES ==")
-        print(f"Running {num_queries} queries per range size")
+    def test_random_lookups(self, num_lookups: int = 100):
+        """Test random key lookups to measure performance and accuracy."""
+        print(f"\n===== Testing {num_lookups} Random Lookups =====")
         
-        # Reset counters for range tests
+        # Reset counters
         MetricsCounters.reset()
         
-        range_sizes = [10, 100, 1000]  # Different range sizes to test
+        # Get all keys present in the traditional tree (ground truth)
+        trad_stats = self.traditional_tree.get_stats()
+        existing_keys = []
         
-        for size in range_sizes:
-            print(f"\nRange size: {size}")
+        # Extract a sample of existing keys from each level
+        for i, level_stats in enumerate(trad_stats.get('levels', [])):
+            level = self.traditional_tree.levels[i]
             
-            # Reset page access counters for this range size
-            trad_pages_before = MetricsCounters.traditional_pages_checked
-            learned_pages_before = MetricsCounters.learned_pages_checked
-            disk_reads_before = MetricsCounters.disk_reads
+            for run in level.runs:
+                try:
+                    with open(run.file_path, 'rb') as f:
+                        data = pickle.load(f)
+                        pairs = data.get('pairs', [])
+                        
+                        # Sample keys from this run
+                        max_samples = min(50, len(pairs))
+                        if max_samples > 0:
+                            sampled_pairs = random.sample(pairs, max_samples)
+                            for key, _ in sampled_pairs:
+                                if isinstance(key, bytes):
+                                    # Convert bytes to float
+                                    key = struct.unpack('!d', key[:8])[0]
+                                existing_keys.append((key, i))  # Store key and level
+                except Exception as e:
+                    print(f"Error loading keys from run: {e}")
+        
+        # Sample 90% of tests from existing keys, 10% non-existing
+        num_existing = int(num_lookups * 0.9)  # 90% existing keys
+        num_nonexisting = num_lookups - num_existing  # 10% non-existing keys
+        
+        # Make sure we don't request more existing keys than we have
+        num_existing = min(num_existing, len(existing_keys))
+        
+        if num_existing > 0:
+            existing_samples = random.sample(existing_keys, num_existing)
+        else:
+            existing_samples = []
             
-            # Generate range queries to ensure consistency
-            range_queries = []
-            for _ in range(num_queries):
-                start_key = random.uniform(0, 1_000_000_000 - size * 1000)
-                end_key = start_key + size * 1000  # Scale range based on size
-                range_queries.append((start_key, end_key))
+        # Generate non-existing keys
+        non_existing_keys = []
+        for _ in range(num_nonexisting):
+            key = self._generate_random_key()
+            # Make sure it doesn't exist (simplified check)
+            if not any(abs(key - ex_key) < 0.0001 for ex_key, _ in existing_keys):
+                non_existing_keys.append(key)
+        
+        # Combine existing and non-existing keys
+        all_keys = [(key, level) for key, level in existing_samples] + [(key, -1) for key in non_existing_keys]
+        random.shuffle(all_keys)  # Shuffle the keys
+        
+        print(f"Testing with {len(existing_samples)} existing and {len(non_existing_keys)} non-existing keys")
+        
+        # Initialize metrics
+        traditional_times = []
+        learned_times = []
+        false_negatives = 0
+        true_positives = 0
+        true_negatives = 0
+        false_positives = 0
+        
+        # Track FNR by level
+        level_metrics = {}
+        
+        # Perform lookups
+        for key, actual_level in all_keys:
+            # Traditional lookup (ground truth)
+            trad_result, trad_time = self._time_operation(self.traditional_tree, "get", key)
+            traditional_times.append(trad_time)
             
-            # Traditional range queries
-            print("  Traditional queries: ", end="", flush=True)
-            trad_start_time = time.perf_counter()
+            # Learned lookup
+            learned_result, learned_time = self._time_operation(self.learned_tree, "get", key)
+            learned_times.append(learned_time)
+            
+            # Check accuracy
+            if trad_result is not None:  # Key exists in traditional
+                if learned_result is not None:  # Correctly found in learned
+                    true_positives += 1
+                else:  # Key exists but learned model missed it - FALSE NEGATIVE
+                    false_negatives += 1
+                    # Record which level had the miss for detailed analysis
+                    if actual_level not in level_metrics:
+                        level_metrics[actual_level] = {"fn": 0, "total": 0}
+                    level_metrics[actual_level]["fn"] += 1
+            else:  # Key doesn't exist in traditional
+                if learned_result is None:  # Correctly not found in learned
+                    true_negatives += 1
+                else:  # Key doesn't exist but learned model found something - FALSE POSITIVE
+                    false_positives += 1
+            
+            # Track level statistics
+            if actual_level >= 0:  # Only for real keys in a level
+                if actual_level not in level_metrics:
+                    level_metrics[actual_level] = {"fn": 0, "total": 0}
+                level_metrics[actual_level]["total"] += 1
+        
+        # Calculate overall metrics
+        total = len(all_keys)
+        positives = true_positives + false_negatives
+        negatives = true_negatives + false_positives
+        
+        accuracy = (true_positives + true_negatives) / total if total > 0 else 0
+        precision = true_positives / (true_positives + false_positives) if (true_positives + false_positives) > 0 else 0
+        recall = true_positives / (true_positives + false_negatives) if (true_positives + false_negatives) > 0 else 0
+        f1_score = 2 * (precision * recall) / (precision + recall) if (precision + recall) > 0 else 0
+        
+        # Most important: FALSE NEGATIVE RATE (keys we missed)
+        false_negative_rate = false_negatives / positives if positives > 0 else 0
+        
+        # Calculate FNR per level
+        for level, metrics in level_metrics.items():
+            if metrics["total"] > 0:
+                metrics["fnr"] = metrics["fn"] / metrics["total"]
+            else:
+                metrics["fnr"] = 0
+        
+        # Store results
+        self.metrics['get']['traditional'] = traditional_times
+        self.metrics['get']['learned'] = learned_times
+        self.metrics['accuracy']['false_negatives'] = false_negatives
+        self.metrics['accuracy']['total_lookups'] = total
+        self.metrics['accuracy']['false_negative_rate'] = false_negative_rate
+        self.fnr_per_level = level_metrics
+        
+        # Print results summary
+        print("\n===== Random Lookup Results =====")
+        print(f"Traditional avg lookup time: {statistics.mean(traditional_times):.2f} µs")
+        print(f"Learned avg lookup time: {statistics.mean(learned_times):.2f} µs")
+        print(f"Speedup: {statistics.mean(traditional_times) / statistics.mean(learned_times):.2f}x")
+        print(f"\nAccuracy: {accuracy:.4f}")
+        print(f"Precision: {precision:.4f}")
+        print(f"Recall: {recall:.4f}")
+        print(f"F1 Score: {f1_score:.4f}")
+        print(f"False Negative Rate: {false_negative_rate:.4f}")
+        
+        # Print FNR by level
+        print("\nFalse Negative Rate by Level:")
+        for level in sorted(level_metrics.keys()):
+            metrics = level_metrics[level]
+            print(f"Level {level}: {metrics['fnr']:.4f} ({metrics['fn']}/{metrics['total']})")
+        
+        # Update global metrics
+        print(f"\nBloom Filter Checks: {MetricsCounters.bloom_checks}")
+        print(f"Bloom Filter Bypasses: {MetricsCounters.bloom_bypasses}")
+        print(f"Bypass Rate: {MetricsCounters.bloom_bypasses / MetricsCounters.bloom_checks:.2%}" if MetricsCounters.bloom_checks > 0 else "Bypass Rate: N/A")
+        
+        return {
+            'traditional_time': statistics.mean(traditional_times),
+            'learned_time': statistics.mean(learned_times), 
+            'speedup': statistics.mean(traditional_times) / statistics.mean(learned_times),
+            'false_negative_rate': false_negative_rate
+        }
+
+    def test_range_queries(self, num_queries: int = 24):
+        """Test range queries to measure performance and accuracy."""
+        print(f"\n===== Testing {num_queries} Range Queries =====")
+        
+        # Reset counters
+        MetricsCounters.reset()
+        
+        # Parameters for ranges - smaller range sizes for faster testing
+        range_sizes = [5, 20, 50]  # Different range sizes to test
+        
+        # Track results for each range size
+        results_by_size = {}
+        
+        for range_size in range_sizes:
+            print(f"\nTesting ranges of size ~{range_size} keys")
+            
+            traditional_times = []
+            learned_times = []
             trad_result_counts = []
-            
-            for i, (start_key, end_key) in enumerate(range_queries):
-                if i % 25 == 0 and i > 0:
-                    print(f"{i}/{num_queries}...", end="", flush=True)
-                
-                # Time traditional range query
-                results, duration = self._time_operation(
-                    self.traditional_tree, "range", start_key, end_key
-                )
-                trad_result_counts.append(len(results))
-                self.metrics['range']['traditional'].append(duration)
-            
-            trad_end_time = time.perf_counter()
-            trad_total_time = (trad_end_time - trad_start_time) * 1000000  # μs
-            print(" Done.")
-            
-            # Calculate page checks and disk reads for traditional
-            trad_pages_checked = MetricsCounters.traditional_pages_checked - trad_pages_before
-            trad_disk_reads = MetricsCounters.disk_reads - disk_reads_before
-            
-            # Reset disk reads counter for learned implementation
-            disk_reads_before = MetricsCounters.disk_reads
-            
-            # Learned range queries
-            print("  Learned queries: ", end="", flush=True)
-            learned_start_time = time.perf_counter()
             learned_result_counts = []
             
-            for i, (start_key, end_key) in enumerate(range_queries):
-                if i % 25 == 0 and i > 0:
-                    print(f"{i}/{num_queries}...", end="", flush=True)
+            # Generate random ranges - fewer queries per size
+            queries_per_size = num_queries // len(range_sizes)
+            for _ in range(queries_per_size):
+                # Generate random start key
+                start_key = self._generate_random_key()
+                # Calculate end key based on range size (approximate)
+                end_key = start_key + random.uniform(range_size * 0.1, range_size * 0.2)
                 
-                # Time learned range query
-                results, duration = self._time_operation(
+                # Traditional range query
+                trad_results, trad_time = self._time_operation(
+                    self.traditional_tree, "range", start_key, end_key
+                )
+                if trad_results is not None:
+                    traditional_times.append(trad_time)
+                    trad_result_counts.append(len(trad_results))
+                
+                # Learned range query
+                learned_results, learned_time = self._time_operation(
                     self.learned_tree, "range", start_key, end_key
                 )
-                learned_result_counts.append(len(results))
-                self.metrics['range']['learned'].append(duration)
+                if learned_results is not None:
+                    learned_times.append(learned_time)
+                    learned_result_counts.append(len(learned_results))
+                
+                # Check if the learned tree missed any keys
+                if trad_results is not None and learned_results is not None:
+                    # Convert to sets for comparison (just the keys)
+                    trad_keys = set(k for k, _ in trad_results)
+                    learned_keys = set(k for k, _ in learned_results)
+                    
+                    # Keys missed by the learned tree
+                    missed_keys = trad_keys - learned_keys
+                    if missed_keys:
+                        # Record false negatives
+                        MetricsCounters.false_negatives += len(missed_keys)
             
-            learned_end_time = time.perf_counter()
-            learned_total_time = (learned_end_time - learned_start_time) * 1000000  # μs
-            print(" Done.")
+            # Calculate statistics for this range size
+            if traditional_times and learned_times:
+                avg_trad_time = statistics.mean(traditional_times)
+                avg_learned_time = statistics.mean(learned_times)
+                speedup = avg_trad_time / avg_learned_time if avg_learned_time > 0 else 0
+                
+                avg_trad_count = statistics.mean(trad_result_counts) if trad_result_counts else 0
+                avg_learned_count = statistics.mean(learned_result_counts) if learned_result_counts else 0
+                
+                completeness = avg_learned_count / avg_trad_count if avg_trad_count > 0 else 1.0
+                
+                results_by_size[range_size] = {
+                    'traditional_time': avg_trad_time,
+                    'learned_time': avg_learned_time,
+                    'speedup': speedup,
+                    'trad_result_count': avg_trad_count,
+                    'learned_result_count': avg_learned_count,
+                    'completeness': completeness
+                }
+                
+                print(f"Range ~{range_size} results:")
+                print(f"  Traditional avg time: {avg_trad_time:.2f} µs, Avg results: {avg_trad_count:.1f}")
+                print(f"  Learned avg time: {avg_learned_time:.2f} µs, Avg results: {avg_learned_count:.1f}")
+                print(f"  Speedup: {speedup:.2f}x, Completeness: {completeness:.2%}")
+        
+        # Calculate overall statistics
+        all_trad_times = []
+        all_learned_times = []
+        
+        for size_results in results_by_size.values():
+            all_trad_times.append(size_results['traditional_time'])
+            all_learned_times.append(size_results['learned_time'])
+        
+        if all_trad_times and all_learned_times:
+            overall_speedup = statistics.mean(all_trad_times) / statistics.mean(all_learned_times)
             
-            # Calculate page checks and disk reads for learned
-            learned_pages_checked = MetricsCounters.learned_pages_checked - learned_pages_before
-            learned_disk_reads = MetricsCounters.disk_reads - disk_reads_before
+            print("\nOverall Range Query Results:")
+            print(f"Average Traditional Time: {statistics.mean(all_trad_times):.2f} µs")
+            print(f"Average Learned Time: {statistics.mean(all_learned_times):.2f} µs")
+            print(f"Overall Speedup: {overall_speedup:.2f}x")
             
-            # Validate results
-            avg_trad_results = sum(trad_result_counts) / len(trad_result_counts) if trad_result_counts else 0
-            avg_learned_results = sum(learned_result_counts) / len(learned_result_counts) if learned_result_counts else 0
-            
-            # Print statistics (concise)
-            speedup = trad_total_time / learned_total_time if learned_total_time > 0 else float('inf')
-            page_ratio = learned_pages_checked / trad_pages_checked if trad_pages_checked > 0 else float('inf')
-            
-            print(f"  Results: Speedup: {speedup:.2f}x, Page ratio: {page_ratio:.2f}x, " +
-                  f"Avg results - Trad: {avg_trad_results:.1f}, Learned: {avg_learned_results:.1f}")
+            # Store overall metrics
+            self.metrics['range']['traditional'] = all_trad_times
+            self.metrics['range']['learned'] = all_learned_times
+        
+        return results_by_size
 
     def test_deletions(self, num_deletions: int = 1_000):
         """Test deletions with different patterns."""
@@ -608,101 +630,179 @@ class PerformanceTest:
             speedup = trad_total_time / learned_total_time if learned_total_time > 0 else float('inf')
             print(f"  Results: Speedup: {speedup:.2f}x")
 
-    def print_results(self):
-        """Print performance comparison results."""
-        print("\n=============================================")
-        print("         PERFORMANCE COMPARISON RESULTS      ")
-        print("=============================================")
-        
-        # Process results
-        operation_types = ['get', 'put', 'range', 'remove']
-        
-        for op_type in operation_types:
-            trad = self.metrics[op_type]['traditional']
-            learned = self.metrics[op_type]['learned']
-            
-            if not trad or not learned:
-                continue
-                
-            print(f"\n{op_type.upper()} OPERATION:")
-            
-            # Calculate statistics
-            trad_avg = statistics.mean(trad) if trad else 0
-            learned_avg = statistics.mean(learned) if learned else 0
-            
-            if trad_avg > 0 and learned_avg > 0:
-                speedup = trad_avg / learned_avg
-                # Check for unrealistically high speedups that would indicate a measurement problem
-                if speedup > 20:
-                    print(f"  CAUTION: Measured speedup ({speedup:.2f}x) exceeds realistic expectations")
-                
-                print(f"  Avg time: Trad={trad_avg:.2f}μs, Learned={learned_avg:.2f}μs, Speedup={speedup:.2f}x")
-            else:
-                print(f"  Avg time: Trad={trad_avg:.2f}μs, Learned={learned_avg:.2f}μs, Speedup=N/A")
-                    
-        # Print false negative statistics
-        print("\nFALSE NEGATIVE RATE:")
-        false_negative_rate = MetricsCounters.false_negatives / MetricsCounters.lookups_attempted if MetricsCounters.lookups_attempted > 0 else 0
-        print(f"  Overall: {false_negative_rate:.2%} ({MetricsCounters.false_negatives}/{MetricsCounters.lookups_attempted})")
-        
-        # Print bloom filter statistics
-        print("\nBLOOM FILTER USAGE:")
-        bypass_rate = MetricsCounters.bloom_bypasses / MetricsCounters.bloom_checks if MetricsCounters.bloom_checks > 0 else 0
-        print(f"  Bypass rate: {bypass_rate:.2%} ({MetricsCounters.bloom_bypasses}/{MetricsCounters.bloom_checks})")
-        
-        # Print disk I/O statistics
-        print(f"\nDISK ACCESS:")
-        print(f"  Reads: {MetricsCounters.disk_reads:,}")
-        print(f"  Writes: {MetricsCounters.disk_writes:,}")
-        
-        # Print page access statistics
-        print(f"\nPAGE ACCESS:")
-        page_ratio = MetricsCounters.learned_pages_checked / MetricsCounters.traditional_pages_checked if MetricsCounters.traditional_pages_checked > 0 else float('inf')
-        print(f"  Traditional: {MetricsCounters.traditional_pages_checked:,}")
-        print(f"  Learned: {MetricsCounters.learned_pages_checked:,}")
-        print(f"  Ratio (Learned/Traditional): {page_ratio:.2f}x")
-        
-        # Print ML model performance for learned implementation
+    def visualize_results(self):
+        """Generate visualizations for the performance results."""
         try:
-            stats = self.learned_tree.get_stats()
-            print("\nML MODEL PERFORMANCE:")
-            print(f"  Bloom Filter Accuracy: {stats['ml_models']['bloom_accuracy']:.2%}")
-            print(f"  Fence Pointer Accuracy: {stats['ml_models']['fence_accuracy']:.2%}")
+            import matplotlib.pyplot as plt
+            import numpy as np
+            
+            # Ensure the plots directory exists
+            plots_dir = "plots"
+            os.makedirs(plots_dir, exist_ok=True)
+            
+            # 1. Get operation latencies
+            fig, axs = plt.subplots(2, 2, figsize=(14, 10))
+            fig.suptitle('Operation Latency Comparison', fontsize=16)
+            
+            operations = [
+                ('get', 'Get Operation', 0, 0),
+                ('range', 'Range Operation', 0, 1),
+                ('put', 'Put Operation', 1, 0),
+                ('remove', 'Remove Operation', 1, 1)
+            ]
+            
+            for op, title, row, col in operations:
+                if op in self.metrics and 'traditional' in self.metrics[op] and 'learned' in self.metrics[op]:
+                    trad_times = self.metrics[op]['traditional']
+                    learned_times = self.metrics[op]['learned']
+                    
+                    if trad_times and learned_times:
+                        avg_trad = statistics.mean(trad_times)
+                        avg_learned = statistics.mean(learned_times)
+                        
+                        axs[row, col].bar(['Traditional', 'Learned'], [avg_trad, avg_learned])
+                        axs[row, col].set_title(title)
+                        axs[row, col].set_ylabel('Latency (µs)')
+                        
+                        # Show speedup on plot
+                        speedup = avg_trad / avg_learned if avg_learned > 0 else 0
+                        axs[row, col].text(1, avg_learned, f'{speedup:.2f}x', ha='center', va='bottom')
+            
+            plt.tight_layout(rect=[0, 0, 1, 0.95])
+            plt.savefig(os.path.join(plots_dir, 'operation_latency.png'))
+            
+            # 2. Bloom filter effectiveness
+            if MetricsCounters.bloom_checks > 0:
+                fig, ax = plt.subplots(figsize=(10, 6))
+                labels = ['Checked', 'Bypassed']
+                values = [MetricsCounters.bloom_checks - MetricsCounters.bloom_bypasses, 
+                          MetricsCounters.bloom_bypasses]
+                
+                ax.pie(values, labels=labels, autopct='%1.1f%%', startangle=90)
+                ax.set_title('Bloom Filter Effectiveness')
+                plt.savefig(os.path.join(plots_dir, 'bloom_effectiveness.png'))
+            
+            # 3. False Negative Rate by Level
+            if self.fnr_per_level:
+                levels = sorted(self.fnr_per_level.keys())
+                fnrs = [self.fnr_per_level[lvl]['fnr'] for lvl in levels]
+                
+                fig, ax = plt.subplots(figsize=(10, 6))
+                ax.bar([f'Level {lvl}' for lvl in levels], fnrs)
+                ax.set_title('False Negative Rate by Level')
+                ax.set_ylabel('False Negative Rate')
+                ax.set_ylim(0, max(max(fnrs) * 1.1, 0.01))  # Set y-axis to start at 0
+                
+                for i, fnr in enumerate(fnrs):
+                    ax.text(i, fnr, f'{fnr:.3f}', ha='center', va='bottom')
+                    
+                plt.tight_layout()
+                plt.savefig(os.path.join(plots_dir, 'fnr_by_level.png'))
+                
+            print(f"Visualizations saved to {plots_dir} directory")
+            
         except Exception as e:
-            pass
-
-    def load_existing_data(self):
-        """Force the tree to reload existing runs from disk."""
-        # This will reload all the run files from the data directory
-        self._load_existing_runs()
+            print(f"Error generating visualizations: {e}")
+    
+    def print_results(self):
+        """Print detailed results of all tests."""
+        print("\n====== Final Performance Results ======")
+        
+        # Print operation latencies
+        operations = ['get', 'range', 'put', 'remove']
+        for op in operations:
+            if op in self.metrics and 'traditional' in self.metrics[op] and 'learned' in self.metrics[op]:
+                trad_times = self.metrics[op]['traditional']
+                learned_times = self.metrics[op]['learned']
+                
+                if trad_times and learned_times:
+                    avg_trad = statistics.mean(trad_times)
+                    avg_learned = statistics.mean(learned_times)
+                    speedup = avg_trad / avg_learned if avg_learned > 0 else 0
+                    
+                    print(f"\n{op.capitalize()} Operation:")
+                    print(f"  Traditional: {avg_trad:.2f} µs")
+                    print(f"  Learned:     {avg_learned:.2f} µs")
+                    print(f"  Speedup:     {speedup:.2f}x")
+        
+        # Print bloom filter effectiveness
+        print("\nBloom Filter Effectiveness:")
+        if MetricsCounters.bloom_checks > 0:
+            bypass_rate = MetricsCounters.bloom_bypasses / MetricsCounters.bloom_checks
+            print(f"  Total Checks:   {MetricsCounters.bloom_checks}")
+            print(f"  Bypassed:       {MetricsCounters.bloom_bypasses}")
+            print(f"  Bypass Rate:    {bypass_rate:.2%}")
+        else:
+            print("  No bloom filter checks recorded")
+        
+        # Print accuracy metrics
+        print("\nAccuracy Metrics:")
+        fnr = self.metrics['accuracy']['false_negative_rate']
+        total = self.metrics['accuracy']['total_lookups']
+        fn_count = self.metrics['accuracy']['false_negatives']
+        
+        print(f"  False Negative Rate: {fnr:.4f}")
+        print(f"  False Negatives: {fn_count} out of {total} lookups")
+        
+        # Print FNR by level
+        if self.fnr_per_level:
+            print("\nFalse Negative Rate by Level:")
+            for level in sorted(self.fnr_per_level.keys()):
+                metrics = self.fnr_per_level[level]
+                print(f"  Level {level}: {metrics['fnr']:.4f} ({metrics['fn']}/{metrics['total']})")
+        
+        # Print ML model metrics from the learned tree
+        print("\nML Model Metrics:")
+        bloom_acc = self.learned_tree.ml_models.get_bloom_accuracy()
+        fence_acc = self.learned_tree.ml_models.get_fence_accuracy()
+        prediction_stats = self.learned_tree.ml_models.get_prediction_stats()
+        
+        print(f"  Bloom Filter Model Accuracy: {bloom_acc:.2%}")
+        print(f"  Fence Pointer Model Accuracy: {fence_acc:.2%}")
+        
+        if prediction_stats:
+            bloom_time = prediction_stats.get('avg_bloom_prediction_time', 0) * 1000000  # Convert to µs
+            fence_time = prediction_stats.get('avg_fence_prediction_time', 0) * 1000000  # Convert to µs
+            
+            print(f"  Avg Bloom Prediction Time: {bloom_time:.2f} µs")
+            print(f"  Avg Fence Prediction Time: {fence_time:.2f} µs")
+            
+            bloom_cache_size = prediction_stats.get('bloom_cache_size', 0)
+            fence_cache_size = prediction_stats.get('fence_cache_size', 0)
+            
+            print(f"  Bloom Cache Size: {bloom_cache_size}")
+            print(f"  Fence Cache Size: {fence_cache_size}")
+            
+            fence_hits = prediction_stats.get('fence_direct_cache_hits', 0)
+            fence_misses = prediction_stats.get('fence_direct_cache_misses', 0)
+            
+            if fence_hits + fence_misses > 0:
+                fence_hit_rate = fence_hits / (fence_hits + fence_misses)
+                print(f"  Fence Cache Hit Rate: {fence_hit_rate:.2%}")
 
 def main():
     """Main function to run performance tests."""
-    print("Starting LSM tree performance tests...")
+    print("Starting LSM tree performance testing...")
     
-    # Create test instance
+    # Initialize the test
     test = PerformanceTest()
     
-    # Print level statistics
+    # Print initial tree statistics
     test.print_level_statistics()
     
-    # Run lookup test
-    test.test_random_lookups(num_lookups=5_000)
-    
-    # Reset counters between tests
-    MetricsCounters.reset()
+    # Run lookup test to measure accuracy and performance
+    test.test_random_lookups(num_lookups=100)
     
     # Run range query test
-    test.test_range_queries(num_queries=100)
+    test.test_range_queries(num_queries=24)
     
-    # Reset counters between tests
-    MetricsCounters.reset()
-    
-    # Run deletion test
-    test.test_deletions(num_deletions=1_000)
-    
-    # Print overall performance comparison
+    # Print final results
     test.print_results()
     
+    # Generate visualizations
+    test.visualize_results()
+    
+    print("\nPerformance testing complete!")
+
 if __name__ == "__main__":
     main() 

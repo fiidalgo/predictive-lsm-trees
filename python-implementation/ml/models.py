@@ -756,43 +756,8 @@ class LSMMLModels:
         # Time the prediction
         start_time = time.perf_counter()
         
-        # OPTIMIZATION: Fast path for boundary keys
-        if level in self.fence_model.level_data:
-            level_info = self.fence_model.level_data[level]
-            
-            # Check bounds for extremely fast prediction
-            if key <= level_info['min_key']:
-                result = 0  # First page
-                self.fence_cache[cache_key] = result
-                
-                # Record timing
-                end_time = time.perf_counter()
-                self.fence_prediction_time += (end_time - start_time)
-                self.fence_prediction_count += 1
-                return result
-            
-            if key >= level_info['max_key']:
-                result = level_info['page_count'] - 1  # Last page
-                self.fence_cache[cache_key] = result
-                
-                # Record timing
-                end_time = time.perf_counter()
-                self.fence_prediction_time += (end_time - start_time)
-                self.fence_prediction_count += 1
-                return result
-            
-            # Check exact match in example keys - extremely fast
-            if key in level_info['examples']:
-                result = level_info['examples'][key]
-                self.fence_cache[cache_key] = result
-                
-                # Record timing
-                end_time = time.perf_counter()
-                self.fence_prediction_time += (end_time - start_time)
-                self.fence_prediction_count += 1
-                return result
-        
-        # Use fast predict
+        # Skip the level_data check which was causing errors
+        # Just use the fence model's predict method directly
         result = self.fence_model.predict(key, level)
         
         # Store in cache
@@ -828,20 +793,23 @@ class LSMMLModels:
         # Time the batch prediction
         start_time = time.perf_counter()
         
-        # Use the fast fence model's batch prediction
-        results = self.fence_model.predict_fence_batch(keys, level)
+        # Create results array
+        results = np.empty(len(keys), dtype=np.int32)
+        
+        # Simply predict each key individually
+        for i, key in enumerate(keys):
+            results[i] = self.fence_model.predict(key, level)
+            
+            # Update cache for future single-key lookups
+            cache_key = (key, level)
+            if len(self.fence_cache) < self.max_cache_size:
+                self.fence_cache[cache_key] = results[i]
         
         # Record timing
         end_time = time.perf_counter()
         prediction_time = (end_time - start_time)
         self.fence_prediction_time += prediction_time
         self.fence_prediction_count += len(keys)
-        
-        # Update cache for future single-key lookups
-        for i, key in enumerate(keys):
-            cache_key = (key, level)
-            if len(self.fence_cache) < self.max_cache_size:
-                self.fence_cache[cache_key] = results[i]
         
         return results
         
