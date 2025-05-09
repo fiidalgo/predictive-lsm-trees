@@ -3,4 +3,4 @@ __pycache__/
 venv/
 data/
 learned_test_data/
-benchmark_data/
+classifier_test_data/
