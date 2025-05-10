@@ -79,7 +79,8 @@ class TraditionalLSMTree:
                  data_dir: str,
                  buffer_size: int = Constants.DEFAULT_BUFFER_SIZE,
                  size_ratio: int = Constants.DEFAULT_LEVEL_SIZE_RATIO,
-                 base_fpr: float = Constants.DEFAULT_BLOOM_FPR):
+                 base_fpr: float = 0.01,
+                 no_compaction_on_init: bool = False):
         logger.info("Initializing TraditionalLSMTree...")
         
         logger.info("Setting up data directory...")
@@ -92,6 +93,7 @@ class TraditionalLSMTree:
         logger.info("Setting up tree parameters...")
         self.size_ratio = size_ratio
         self.base_fpr = base_fpr
+        self.no_compaction_on_init = no_compaction_on_init
         self.tree_mutex = threading.Lock()
         
         logger.info("Initializing levels...")
@@ -135,45 +137,54 @@ class TraditionalLSMTree:
         if not os.path.exists(self.data_dir):
             logger.info("Data directory does not exist, skipping run loading")
             return
-            
-        for level_dir in os.listdir(self.data_dir):
-            if not level_dir.startswith('level_'):
-                continue
+        
+        # Temporarily store the original compaction setting
+        original_compaction_setting = self.no_compaction_on_init
+        # Force no compaction during run loading
+        self.no_compaction_on_init = True
+        
+        try:
+            for level_dir in os.listdir(self.data_dir):
+                if not level_dir.startswith('level_'):
+                    continue
+                    
+                level_num = int(level_dir.split('_')[1])
+                level_path = os.path.join(self.data_dir, level_dir)
                 
-            level_num = int(level_dir.split('_')[1])
-            level_path = os.path.join(self.data_dir, level_dir)
-            
-            if level_num >= len(self.levels):
-                continue
+                if level_num >= len(self.levels):
+                    continue
+                    
+                logger.info(f"Loading runs from level {level_num}...")
                 
-            logger.info(f"Loading runs from level {level_num}...")
-            
-            # Get all run files and sort by timestamp (newest first)
-            run_files = [f for f in os.listdir(level_path) if f.startswith('run_')]
-            run_files.sort(reverse=True)  # Newest first
-            
-            # Only keep the most recent runs up to level capacity
-            max_runs = self.levels[level_num].capacity
-            run_files = run_files[:max_runs]
-            
-            # Delete old runs
-            for old_file in os.listdir(level_path):
-                if old_file.startswith('run_') and old_file not in run_files:
-                    try:
-                        os.remove(os.path.join(level_path, old_file))
-                        logger.info(f"Deleted old run: {old_file}")
-                    except Exception as e:
-                        logger.warning(f"Failed to delete old run {old_file}: {e}")
-            
-            # Load the kept runs
-            for run_file in run_files:
-                run_path = os.path.join(level_path, run_file)
-                logger.info(f"Loading run: {run_path}")
-                # Pass level-specific FPR based on Monkey paper
-                run = Run(run_path, level_num)
-                run.load()
-                self.levels[level_num].add_run(run)
+                # Get all run files and sort by timestamp (newest first)
+                run_files = [f for f in os.listdir(level_path) if f.startswith('run_')]
+                run_files.sort(reverse=True)  # Newest first
                 
+                # Only keep the most recent runs up to level capacity
+                max_runs = self.levels[level_num].capacity
+                run_files = run_files[:max_runs]
+                
+                # Delete old runs
+                for old_file in os.listdir(level_path):
+                    if old_file.startswith('run_') and old_file not in run_files:
+                        try:
+                            os.remove(os.path.join(level_path, old_file))
+                            logger.info(f"Deleted old run: {old_file}")
+                        except Exception as e:
+                            logger.warning(f"Failed to delete old run {old_file}: {e}")
+                
+                # Load the kept runs
+                for run_file in run_files:
+                    run_path = os.path.join(level_path, run_file)
+                    logger.info(f"Loading run: {run_path}")
+                    # Pass level-specific FPR based on Monkey paper
+                    run = Run(run_path, level_num)
+                    run.load()
+                    self.levels[level_num].add_run(run)
+        finally:
+            # Restore original compaction setting
+            self.no_compaction_on_init = original_compaction_setting
+                    
         logger.info("Finished loading existing runs")
         
     def _string_to_fixed_bytes(self, string_value: str) -> bytes:
@@ -338,7 +349,8 @@ class TraditionalLSMTree:
         run.create_from_pairs(self.buffer.get_sorted_pairs())
         
         # Add run to level 0
-        if self.levels[0].is_full():
+        if self.levels[0].is_full() and not self.no_compaction_on_init:
+            # Skip compaction during initialization if flag is set
             self._compact(0)
         self.levels[0].add_run(run)
         
@@ -347,6 +359,11 @@ class TraditionalLSMTree:
         
     def _compact(self, level: int) -> None:
         """Compact a level by merging its runs with the next level."""
+        # Skip compaction during initialization if flag is set
+        if self.no_compaction_on_init:
+            logger.info(f"Skipping compaction of level {level} due to no_compaction_on_init flag")
+            return
+            
         if level >= len(self.levels) - 1:
             logger.info(f"Cannot compact level {level} as it is the last level")
             return
@@ -468,4 +485,66 @@ class TraditionalLSMTree:
             
         stats['bloom_filters'] = bloom_stats
         
-        return stats 
+        return stats
+
+    def get_from_level(self, key: float, level: int) -> Optional[str]:
+        """Get value for a key from a specific level only.
+        
+        Parameters:
+        -----------
+        key : float
+            The key to look up
+        level : int
+            The specific level to check
+        
+        Returns:
+        --------
+        Optional[str]
+            The value if found in the specified level, None otherwise
+        """
+        # Convert to fixed-size byte representation
+        bytes_key = self._float_to_fixed_bytes(key)
+        
+        # Check if level is valid
+        if level < 0 or level >= len(self.levels):
+            return None
+        
+        # Get from the specified level only
+        bytes_value = self.levels[level].get(bytes_key)
+        if bytes_value is not None:
+            # Convert back to string
+            value = bytes_value.rstrip(b'\x00').decode('utf-8')
+            return None if is_tombstone(value) else value
+        
+        return None
+
+    def get_level_for_key(self, key: float) -> Optional[int]:
+        """Determine which level contains the specified key.
+        
+        Parameters:
+        -----------
+        key : float
+            The key to search for
+        
+        Returns:
+        --------
+        Optional[int]
+            The level number where the key is found, or None if not found in any level
+        """
+        # Convert to fixed-size byte representation
+        bytes_key = self._float_to_fixed_bytes(key)
+        
+        # Check memory buffer first
+        bytes_value = self.buffer.get(bytes_key)
+        if bytes_value is not None:
+            # Key is in the buffer
+            return -1  # Use -1 to represent buffer
+        
+        # Check each level
+        for i, level in enumerate(self.levels):
+            bytes_value = level.get(bytes_key)
+            if bytes_value is not None:
+                return i
+            
+        # Key not found in any level
+        return None 

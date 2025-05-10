@@ -1,3 +1,3 @@
-from .learned_bloom import LearnedBloomFilterManager
+from .models import LSMMLModels
 
-__all__ = ['LearnedBloomFilterManager'] 
+__all__ = ['LSMMLModels'] 

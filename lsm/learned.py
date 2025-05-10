@@ -31,11 +31,11 @@ def register_metrics(metrics_counters):
 class LearnedLevel(Level):
     """Level with ML-only operations."""
     
-    def __init__(self, level_id: int, max_runs: int, ml_models=None, bloom_thresh=0.3, fence_thresh=0.5):
+    def __init__(self, level_id: int, max_runs: int, ml_models=None, bloom_thresh=0.2, fence_thresh=0.5):
         super().__init__(level_id, max_runs)
         self.ml_models = ml_models
         self.level_id = level_id
-        self.bloom_thresh = bloom_thresh  # More aggressive threshold to bypass more runs
+        self.bloom_thresh = bloom_thresh  # Lowered from 0.3 to 0.2 for more aggressive filtering
         self.fence_thresh = fence_thresh
         # Cache predictions to avoid repeated ML calls
         self.bloom_cache = {}  # key -> bool
@@ -92,9 +92,16 @@ class LearnedLevel(Level):
                 return self.bloom_cache[cache_key]
             
             self.cache_misses += 1
+            
+            # Use adaptive threshold based on level
+            # Lower levels need higher recall to avoid missing keys
+            # Increased level-based adaptivity for more aggressive filtering at higher levels
+            base_threshold = self.bloom_thresh
+            adaptive_threshold = max(0.05, base_threshold - (0.08 * run.level))
+            
             # Use ML to predict if key exists
             bloom_prediction = self.ml_models.predict_bloom(key)
-            might_contain = bloom_prediction >= self.bloom_thresh
+            might_contain = bloom_prediction >= adaptive_threshold
             self.bloom_cache[cache_key] = might_contain
             
             # Update class-level counters
@@ -132,109 +139,99 @@ class LearnedLevel(Level):
         
         Parameters:
         -----------
-        keys : List[float] or numpy.ndarray
-            The keys to check
+        run : Run
+            The run to check
+        keys : List[float]
+            List of keys to check
             
         Returns:
         --------
         numpy.ndarray
-            Boolean mask where True indicates the run might contain the key
+            Boolean mask where True means the run might contain the key
         """
         import numpy as np
-        import struct
         
+        # Early exit if no keys
+        if not keys:
+            return np.array([], dtype=bool)
+            
+        # Convert keys to array if needed
         if not isinstance(keys, np.ndarray):
-            keys = np.array(keys, dtype=np.float64)
-        elif keys.dtype != np.float64:
-            keys = keys.astype(np.float64)
+            keys = np.array(keys)
         
-        # Create byte_keys for actual bloom filter checks if needed
-        byte_keys = None
-        if hasattr(self, '_float_to_fixed_bytes'):
-            byte_keys = [self._float_to_fixed_bytes(key) for key in keys]
-            
-        # Convert run's min/max keys from bytes to float if needed
-        min_key = run.min_key
-        max_key = run.max_key
+        # Create mask of same length as keys, all False initially
+        mask = np.zeros(len(keys), dtype=bool)
         
-        # Handle different types of min/max keys
-        if isinstance(min_key, bytes) and not isinstance(keys[0], bytes):
-            # Ensure we have exactly 8 bytes for float64
-            if len(min_key) != 8:
-                # If we have more than 8 bytes, take the first 8
-                # If we have less than 8 bytes, pad with zeros
-                min_key = min_key[:8].ljust(8, b'\x00')
-            min_key = struct.unpack('d', min_key)[0]
-        elif isinstance(min_key, str):
-            min_key = float(min_key)
+        # Basic range check - we can skip if keys are outside the run's range
+        if run.min_key is not None and run.max_key is not None:
+            # Get keys potentially in range
+            in_range_mask = (keys >= run.min_key) & (keys <= run.max_key)
             
-        if isinstance(max_key, bytes) and not isinstance(keys[0], bytes):
-            # Ensure we have exactly 8 bytes for float64
-            if len(max_key) != 8:
-                # If we have more than 8 bytes, take the first 8
-                # If we have less than 8 bytes, pad with zeros
-                max_key = max_key[:8].ljust(8, b'\x00')
-            max_key = struct.unpack('d', max_key)[0]
-        elif isinstance(max_key, str):
-            max_key = float(max_key)
+            # If no keys in range, return all False mask
+            if not np.any(in_range_mask):
+                return mask
+                
+            # Update mask for keys in range for basic filtering
+            mask = in_range_mask
             
-        # Quick range checks first (this is very fast)
-        if isinstance(keys[0], bytes) and isinstance(min_key, bytes):
-            # Use direct byte comparison for range check
-            mask = np.array([(key >= min_key and key <= max_key) for key in keys])
+            # Only process keys that passed basic range check
+            byte_keys = keys[mask]
         else:
-            # Use numpy for faster range check with float keys
-            mask = (keys >= min_key) & (keys <= max_key)
-        
-        # If no keys pass the range check, return empty mask
-        if not mask.any():
+            # If run doesn't have min/max keys, check all keys
+            byte_keys = keys
+            # All keys should be checked against model
+            mask = np.ones(len(keys), dtype=bool)
+            
+        # If no models, just return the range mask
+        if self.ml_models is None:
             return mask
-            
-        # Only process keys that passed the range check
-        remaining_keys = keys[mask]
-        if byte_keys:
-            remaining_byte_keys = [byte_keys[i] for i, m in enumerate(mask) if m]
         
-        # Use ML-based bloom filter for remaining keys
-        if self.ml_models is not None:
-            run_id = os.path.basename(run.file_path)
+        try:
+            # Predict with adaptive threshold based on level
+            # Lower levels need higher recall to avoid missing keys
+            base_threshold = self.bloom_thresh
+            adaptive_threshold = max(0.05, base_threshold - (0.08 * run.level))
             
-            # Get batch predictions from ML model
-            bloom_predictions = self.ml_models.predict_bloom_batch(remaining_keys)
-            might_contain_mask = bloom_predictions >= self.bloom_thresh
+            # Get raw probabilities from model
+            probabilities = self.ml_models.predict_bloom_batch(byte_keys)
             
-            # Update bloom filter statistics
-            self.bloom_checks += len(remaining_keys)
-            self.bloom_bypasses += len(remaining_keys) - np.sum(might_contain_mask)
+            # Apply adaptive threshold
+            result_mask = probabilities >= adaptive_threshold
             
-            # Update bloom filter cache for future single-key lookups
-            for i, key in enumerate(remaining_keys):
-                cache_key = (run_id, key)
-                self.bloom_cache[cache_key] = might_contain_mask[i]
+            # Detect true negatives using real bloom filter
+            true_negatives = np.where(~result_mask)[0]
             
-            # Create mask aligned with original keys
-            result_mask = np.zeros_like(mask)
-            result_mask[mask] = might_contain_mask
-            
-            # Update global counters
+            # Update global counters for ML bloom filter bypasses
             if MetricsCounters is not None:
-                MetricsCounters.bloom_checks += len(remaining_keys)
-                MetricsCounters.bloom_bypasses += (len(remaining_keys) - np.sum(might_contain_mask))
+                # Count each ML-predicted negative as a bypass
+                MetricsCounters.bloom_bypasses += len(true_negatives)
+                
+            # Create temporary array for final results
+            temp_result = np.zeros(len(mask), dtype=bool)
+            
+            # Update the temp result for keys that were in range
+            active_indices = np.where(mask)[0]
+            for i, orig_idx in enumerate(active_indices):
+                if i < len(result_mask):
+                    temp_result[orig_idx] = result_mask[i]
             
             # Double-check with actual bloom filter when available
-            if run.bloom_filter is not None and byte_keys:
+            if run.bloom_filter is not None and byte_keys.size > 0:
                 # Track bypasses from actual bloom filter checks
                 actual_bypasses = 0
                 
                 # Create new mask that combines ML prediction with real bloom filter
-                final_result_mask = np.zeros_like(mask)
+                final_result_mask = np.zeros_like(temp_result)
                 
-                for i, check in enumerate(result_mask):
-                    if check:
-                        # Only check bloom filter for keys the ML model said might exist
-                        byte_key = byte_keys[i]
+                # Get indices of keys that ML model said might exist
+                ml_positives = np.where(temp_result)[0]
+                
+                for idx in ml_positives:
+                    # Only check bloom filter for keys the ML model said might exist
+                    if idx < len(keys):
+                        byte_key = keys[idx]
                         if run.might_contain(byte_key):
-                            final_result_mask[i] = True
+                            final_result_mask[idx] = True
                         else:
                             actual_bypasses += 1
                 
@@ -245,31 +242,12 @@ class LearnedLevel(Level):
                 # Return the combined mask
                 return final_result_mask
             
-            return result_mask
-        else:
-            # No ML models, use traditional bloom filter - less efficient
-            # but we're not in this path anyway in our learned implementation
-            result_mask = np.zeros_like(mask)
+            return temp_result
             
-            # For each key, check with traditional bloom filter
-            bloom_checks = 0
-            bloom_bypasses = 0
-            
-            for i, key in enumerate(keys):
-                if mask[i]:
-                    bloom_checks += 1
-                    byte_key = byte_keys[i] if byte_keys else key
-                    contains = run.might_contain(byte_key)
-                    result_mask[i] = contains
-                    if not contains:
-                        bloom_bypasses += 1
-            
-            # Update global counters
-            if MetricsCounters is not None:
-                MetricsCounters.bloom_checks += bloom_checks
-                MetricsCounters.bloom_bypasses += bloom_bypasses
-            
-            return result_mask
+        except Exception as e:
+            # On error, be conservative and assume all keys might be in the run
+            logger.warning(f"Error in ML bloom filter prediction: {e}")
+            return mask
     
     def get(self, key: float) -> Optional[str]:
         """Get using ONLY ML predictions, no fallbacks."""
@@ -295,7 +273,10 @@ class LearnedLevel(Level):
                     self.cache_misses += 1
                     # Use ML to predict if key exists
                     bloom_prediction = self.ml_models.predict_bloom(key)
-                    might_contain = bloom_prediction >= self.bloom_thresh
+                    # Use adaptive threshold based on level
+                    base_threshold = self.bloom_thresh
+                    adaptive_threshold = max(0.05, base_threshold - (0.08 * self.level_id))
+                    might_contain = bloom_prediction >= adaptive_threshold
                     self.bloom_cache[cache_key] = might_contain
                 
                 # Skip run if ML says key doesn't exist - THIS IS CRITICAL!
@@ -442,11 +423,23 @@ class LearnedLSMTree(TraditionalLSMTree):
                  size_ratio: int = Constants.DEFAULT_LEVEL_SIZE_RATIO,
                  base_fpr: float = 0.01,
                  validation_rate: float = 0.05,
-                 train_every: int = 4):  # How often to train models (every N flushes/compactions)
+                 train_every: int = 4,    # How often to train models (every N flushes/compactions)
+                 load_existing: bool = True,  # Whether to load existing models or start fresh
+                 bloom_thresh: float = 0.2,  # Bloom filter threshold - more aggressive default (was 0.3)
+                 no_compaction_on_init: bool = False):  # Whether to skip compaction during initialization
         # Initialize ML models
         models_dir = os.path.join(data_dir, "ml_models")
         ensure_directory(models_dir)
         self.ml_models = LSMMLModels(models_dir)
+        
+        # Store whether to load existing models
+        self.load_existing = load_existing
+        
+        # Store bloom filter threshold
+        self.bloom_thresh = bloom_thresh
+        
+        # Store compaction preference
+        self.no_compaction_on_init = no_compaction_on_init
         
         # Training frequency settings
         self.train_every = train_every
@@ -481,14 +474,61 @@ class LearnedLSMTree(TraditionalLSMTree):
         
         # Call parent constructor
         super().__init__(data_dir, buffer_size, size_ratio, base_fpr)
+        
+        # Load ML models and apply the trained thresholds if requested
+        if self.load_existing:
+            self._load_ml_models()
+        else:
+            # Initialize empty training data
+            self.ml_models.fence_data = {lvl: [] for lvl in range(self.ml_models.MAX_LEVEL)}
+            self.ml_models.bloom_data = {lvl: [] for lvl in range(self.ml_models.MAX_LEVEL)}
+            print("Starting with fresh ML models (no existing models loaded)")
+    
+    def _load_ml_models(self):
+        """Load ML models and propagate the trained bloom threshold to levels."""
+        if not hasattr(self, 'ml_models') or self.ml_models is None:
+            return
+            
+        # Load models from disk
+        self.ml_models.load_models()
+            
+        if hasattr(self.ml_models, 'bloom_model') and self.ml_models.bloom_model is not None:
+            # Get the trained decision threshold from the bloom model
+            if hasattr(self.ml_models.bloom_model, 'decision_threshold'):
+                bloom_threshold = self.ml_models.bloom_model.decision_threshold
+                
+                # Log the threshold value
+                print(f"Using trained bloom filter threshold: {bloom_threshold:.4f}")
+                
+                # Apply this threshold to all levels
+                for level in self.levels:
+                    if isinstance(level, LearnedLevel):
+                        # Update the bloom threshold for each level
+                        level.bloom_thresh = bloom_threshold
+                        print(f"Set level {level.level_id} bloom threshold to {bloom_threshold:.4f}")
+                
+                # Also add the threshold to the tree itself for any direct uses
+                self.bloom_thresh = bloom_threshold
+                print(f"Set tree bloom threshold to {bloom_threshold:.4f}")
     
     def _init_levels(self) -> None:
         """Initialize levels with ML capabilities."""
         max_level = 7  # Same as traditional
+        
+        # Match TraditionalLSMTree's capacity calculations exactly
+        level0_capacity = 4  # Allow 4 runs in level 0 before compaction
+        base_size_bytes = self.buffer.size_bytes
+        
         for i in range(max_level):
-            capacity = calculate_level_capacity(1, i, self.size_ratio)
-            # Use LearnedLevel instead of Level
-            self.levels.append(LearnedLevel(i, capacity, self.ml_models))
+            if i == 0:
+                # Level 0 uses number of runs as capacity
+                capacity = level0_capacity
+            else:
+                # Other levels use bytes as capacity with size ratio
+                capacity = base_size_bytes * (self.size_ratio ** i)
+                
+            # Use LearnedLevel instead of Level with the specified bloom threshold
+            self.levels.append(LearnedLevel(i, capacity, self.ml_models, bloom_thresh=self.bloom_thresh))
     
     def get(self, key: float) -> Optional[str]:
         """Get with ML-only search, with periodic validation."""
@@ -538,6 +578,10 @@ class LearnedLSMTree(TraditionalLSMTree):
                     run_id = os.path.basename(run.file_path)
                     cache_key = (run_id, key)
                     
+                    # Update global counters
+                    if MetricsCounters is not None:
+                        MetricsCounters.bloom_checks += 1
+                    
                     # Check cache first
                     if cache_key in level.bloom_cache:
                         level.cache_hits += 1
@@ -546,7 +590,10 @@ class LearnedLSMTree(TraditionalLSMTree):
                         level.cache_misses += 1
                         # Use ML to predict if key exists
                         bloom_prediction = level.ml_models.predict_bloom(key)
-                        might_contain = bloom_prediction >= level.bloom_thresh
+                        # Use adaptive threshold based on level
+                        base_threshold = level.bloom_thresh
+                        adaptive_threshold = max(0.05, base_threshold - (0.08 * level.level_id))
+                        might_contain = bloom_prediction >= adaptive_threshold
                         level.bloom_cache[cache_key] = might_contain
                     
                     # Skip run if ML says key doesn't exist
@@ -702,7 +749,7 @@ class LearnedLSMTree(TraditionalLSMTree):
                     page_id = i // records_per_page
                     
                     # Add to training data
-                    self.ml_models.add_bloom_training_data(key, True)  # Key exists
+                    self.ml_models.add_bloom_training_data(key, level, True)  # Key exists with level
                     self.ml_models.add_fence_training_data(key, level, page_id)
                 
                 # Add some negative samples for bloom filter
@@ -713,11 +760,25 @@ class LearnedLSMTree(TraditionalLSMTree):
                     for _ in range(num_negative_samples):
                         fake_key = random.uniform(min_key - key_range * 0.1, max_key + key_range * 0.1)
                         if fake_key not in key_set:
-                            self.ml_models.add_bloom_training_data(fake_key, False)
+                            self.ml_models.add_bloom_training_data(fake_key, level, False)
                 
-                # Train models
-                self.ml_models.train_bloom_model()
-                self.ml_models.train_fence_model()
+                # Train bloom filter models
+                self.ml_models.train_bloom_models()
+                
+                # Prepare fence pointer training data
+                X_by_level = {}
+                y_by_level = {}
+                
+                # Only train for the specific level where new data was added
+                if level in self.ml_models.fence_data and self.ml_models.fence_data[level]:
+                    # Extract keys and pages from fence_data for this level
+                    keys = [item[0] for item in self.ml_models.fence_data[level]]
+                    pages = [item[1] for item in self.ml_models.fence_data[level]]
+                    X_by_level[level] = keys
+                    y_by_level[level] = pages
+                    
+                    # Train fence pointer models with proper arguments
+                    self.ml_models.train_fence_models(X_by_level, y_by_level)
                 
                 # Update statistics
                 self.training_stats['bloom']['samples_seen'] += len(pairs)
@@ -726,6 +787,9 @@ class LearnedLSMTree(TraditionalLSMTree):
                 self.training_stats['fence']['training_events'] += 1
                 self.training_stats['bloom']['last_accuracy'] = self.ml_models.get_bloom_accuracy()
                 self.training_stats['fence']['last_accuracy'] = self.ml_models.get_fence_accuracy()
+                
+                # Apply the updated thresholds after training
+                self._load_ml_models()
         except Exception as e:
             logger.warning(f"Error training models: {e}")
     

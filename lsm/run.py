@@ -4,13 +4,27 @@ import struct
 import logging
 import math
 import time
-from typing import List, Tuple, Optional, Dict, Any
+from typing import List, Tuple, Optional, Dict, Any, Union
 from .bloom import BloomFilter
 from .utils import Constants, ensure_directory, merge_sorted_pairs, is_tombstone
 
 # Configure logging
 logging.basicConfig(level=logging.WARNING)  # Change from INFO to WARNING
 logger = logging.getLogger(__name__)
+
+# Helper function for key conversion
+def bytes_to_float(key: bytes) -> Union[float, bytes]:
+    """Convert bytes to float if possible."""
+    if not isinstance(key, bytes):
+        return key
+    try:
+        # Make sure we have at least 8 bytes, pad if needed
+        bs_padded = key[:8].ljust(8, b'\x00')
+        return struct.unpack('!d', bs_padded)[0]
+    except (struct.error, ValueError, TypeError):
+        # Fall back to original value if unpacking fails
+        logger.warning(f"Failed to unpack bytes to float: {key}")
+        return key
 
 class Run:
     """Represents a sorted string table (SSTable) in the LSM tree."""
@@ -111,7 +125,16 @@ class Run:
                     self.min_key = data['pairs'][0][0]
                 if self.max_key is None and data['pairs']:
                     self.max_key = data['pairs'][-1][0]
-                    
+                
+                # Convert stored bytes to floats
+                # Convert min_key and max_key to floats if they're bytes
+                self.min_key = bytes_to_float(self.min_key)
+                self.max_key = bytes_to_float(self.max_key)
+
+                # Convert fence pointer arrays
+                self.page_min_keys = [bytes_to_float(k) for k in self.page_min_keys]
+                self.page_max_keys = [bytes_to_float(k) for k in self.page_max_keys]
+                
             logger.info(f"Run loaded successfully with {self.entry_count} entries, {self.num_pages} pages, and Bloom filter FPR: {self.bloom_fpr}")
         except Exception as e:
             logger.error(f"Error loading run: {e}")
@@ -137,23 +160,34 @@ class Run:
         bool
             True if the run might contain the key, False if definitely does not
         """
+        # Convert key to float if needed
+        key_float = bytes_to_float(key) if isinstance(key, bytes) else key
+        
         # First, do a basic range check
         if self.min_key is None or self.max_key is None:
             # If we don't have min/max keys, assume it might contain the key
             return True
             
-        if key < self.min_key or key > self.max_key:
+        if key_float < self.min_key or key_float > self.max_key:
             return False
         
         # If ML models are provided, use the learned model
         if ml_models is not None:
             try:
-                # Get prediction from model (0.0 to 1.0)
-                prediction = ml_models.predict_bloom(key)
+                # Use adaptive thresholds based on level - deeper levels can be more aggressive
+                # since false negatives at deep levels have less impact (fewer total keys will match)
+                adaptive_thresh = bloom_thresh
+                if hasattr(self, 'level'):
+                    # Lower threshold for deeper levels (more aggressive filtering)
+                    # Level 0 has highest threshold (least aggressive)
+                    adaptive_thresh = max(0.1, bloom_thresh - (0.05 * self.level))
                 
-                # Use the provided threshold - lower values will be more aggressive
+                # Get prediction from model (0.0 to 1.0)
+                prediction = ml_models.predict_bloom(key_float)
+                
+                # Use the adaptive threshold - lower values will be more aggressive
                 # about filtering out runs (but risk more false negatives)
-                return prediction >= bloom_thresh
+                return prediction >= adaptive_thresh
             except Exception as e:
                 # On any error, default to True for safety
                 logger.warning(f"Bloom filter prediction failed: {e}")
@@ -166,17 +200,21 @@ class Run:
         # If no bloom filter available, assume it might contain the key
         return True
         
-    def get(self, key: float) -> Optional[str]:
+    def get(self, key) -> Optional[str]:
         """Get value for a key."""
+        # Make sure key is in the right format
+        original_key = key
+        key_float = bytes_to_float(key) if isinstance(key, bytes) else key
+        
         # Check bloom filter first (optimization)
-        if self.bloom_filter is not None and not self.bloom_filter.might_contain(key):
+        if self.bloom_filter is not None and not self.bloom_filter.might_contain(original_key):
             return None
             
         # If we have fence pointers, use them to find the right page
         if self.page_min_keys and hasattr(self, 'num_pages') and self.num_pages > 1:
-            page_id = self._find_page_with_fence_pointers(key)
+            page_id = self._find_page_with_fence_pointers(key_float)
             if page_id is not None:
-                return self.get_from_page(key, page_id)
+                return self.get_from_page(key_float, page_id)
             
         # Fallback to traditional binary search
         with open(self.file_path, 'rb') as f:
@@ -187,43 +225,81 @@ class Run:
             left, right = 0, len(pairs) - 1
             while left <= right:
                 mid = (left + right) // 2
-                if pairs[mid][0] == key:
-                    return pairs[mid][1]
-                elif pairs[mid][0] < key:
+                mid_key, mid_value = pairs[mid]
+                
+                # Convert mid_key to float if needed
+                mid_key_float = bytes_to_float(mid_key) if isinstance(mid_key, bytes) else mid_key
+                
+                # Handle the case of string or incomparable types
+                if isinstance(mid_key_float, bytes) or isinstance(key_float, bytes):
+                    # If at least one is bytes, do bytes comparison if possible
+                    if isinstance(mid_key, bytes) and isinstance(original_key, bytes):
+                        if mid_key == original_key:
+                            return mid_value
+                        elif mid_key < original_key:
+                            left = mid + 1
+                        else:
+                            right = mid - 1
+                        continue
+                    else:
+                        # Can't compare different types, move through the list
+                        left = mid + 1
+                        continue
+                
+                # Both are comparable types (floats)
+                if mid_key_float == key_float:
+                    return mid_value
+                elif mid_key_float < key_float:
                     left = mid + 1
                 else:
                     right = mid - 1
                     
         return None
         
-    def range(self, start_key: float, end_key: float) -> List[Tuple[float, str]]:
+    def range(self, start_key, end_key) -> List[Tuple[float, str]]:
         """Get all key-value pairs in the given range."""
         result = []
+        
+        # Convert keys to float if needed
+        start_key_float = bytes_to_float(start_key) if isinstance(start_key, bytes) else start_key
+        end_key_float = bytes_to_float(end_key) if isinstance(end_key, bytes) else end_key
         
         # Use fence pointers to find the start and end pages
         start_page = None
         end_page = None
         
         if self.page_min_keys and self.page_max_keys:
-            # Find start page
+            # Find start page - fence pointers are already converted to float in load()
             for i, min_key in enumerate(self.page_min_keys):
-                if min_key <= start_key and i < len(self.page_max_keys) and self.page_max_keys[i] >= start_key:
+                max_key = self.page_max_keys[i]
+                
+                # Skip if we can't compare
+                if (isinstance(min_key, bytes) and not isinstance(start_key_float, bytes)) or \
+                   (not isinstance(min_key, bytes) and isinstance(start_key_float, bytes)):
+                    continue
+                
+                if min_key <= start_key_float and max_key >= start_key_float:
                     start_page = i
                     break
-                if min_key > start_key:
+                if min_key > start_key_float:
                     start_page = i
                     break
             
             # Find end page
             for i, max_key in enumerate(self.page_max_keys):
-                if max_key >= end_key:
+                # Skip if we can't compare
+                if (isinstance(max_key, bytes) and not isinstance(end_key_float, bytes)) or \
+                   (not isinstance(max_key, bytes) and isinstance(end_key_float, bytes)):
+                    continue
+                        
+                if max_key >= end_key_float:
                     end_page = i
                     break
             
             # If we found valid pages, use them
             if start_page is not None and end_page is not None:
                 for page_id in range(start_page, end_page + 1):
-                    page_results = self.get_range_from_page(start_key, end_key, page_id)
+                    page_results = self.get_range_from_page(start_key_float, end_key_float, page_id)
                     result.extend(page_results)
                 return result
         
@@ -232,12 +308,25 @@ class Run:
             data = pickle.load(f)
             pairs = data['pairs']
             
-            # Scan through relevant pages
+            # Scan through relevant pairs
             for pair in pairs:
                 key, value = pair
-                if start_key <= key <= end_key:
+                
+                # Convert key to float if needed for comparison
+                key_float = bytes_to_float(key) if isinstance(key, bytes) else key
+                
+                # Handle the case of incomparable types
+                if isinstance(key_float, bytes) or isinstance(start_key_float, bytes) or isinstance(end_key_float, bytes):
+                    # Do bytes comparison if possible
+                    if isinstance(key, bytes) and isinstance(start_key, bytes) and isinstance(end_key, bytes):
+                        if start_key <= key <= end_key:
+                            result.append((key, value))
+                    continue
+                
+                # Both are comparable types (floats)
+                if start_key_float <= key_float <= end_key_float:
                     result.append((key, value))
-                elif key > end_key:
+                elif key_float > end_key_float:
                     break
                     
         return result
@@ -246,7 +335,7 @@ class Run:
         """Get size of run in bytes."""
         return os.path.getsize(self.file_path) if os.path.exists(self.file_path) else 0 
 
-    def get_from_page(self, key: float, page_id: int) -> Optional[str]:
+    def get_from_page(self, key, page_id: int) -> Optional[str]:
         """Get value for a key from a specific page. Optimized for minimal disk I/O."""
         # Input validation
         if page_id < 0 or (hasattr(self, 'num_pages') and page_id >= self.num_pages):
@@ -254,8 +343,20 @@ class Run:
             
         # Use fence pointers if available to quickly reject keys outside page range
         if self.page_min_keys and self.page_max_keys and len(self.page_min_keys) > page_id and len(self.page_max_keys) > page_id:
-            if key < self.page_min_keys[page_id] or key > self.page_max_keys[page_id]:
-                return None
+            min_key = self.page_min_keys[page_id]
+            max_key = self.page_max_keys[page_id]
+            
+            # Handle incomparable types
+            if (isinstance(min_key, bytes) and not isinstance(key, bytes)) or \
+               (not isinstance(min_key, bytes) and isinstance(key, bytes)) or \
+               (isinstance(max_key, bytes) and not isinstance(key, bytes)) or \
+               (not isinstance(max_key, bytes) and isinstance(key, bytes)):
+                # Can't determine if key is in range, so continue
+                pass
+            else:
+                # Compare when types match
+                if key < min_key or key > max_key:
+                    return None
         
         # Try to access page from cache first if available
         pairs = None
@@ -282,6 +383,7 @@ class Run:
                         self.page_cache.put(self.file_path, page_id, pairs)
             except Exception as e:
                 # Handle file access errors
+                logger.error(f"Error loading page: {e}")
                 return None
         
         # Binary search within the page
@@ -291,24 +393,57 @@ class Run:
         # Fast path for small pages (linear scan)
         if len(pairs) <= 8:
             for k, v in pairs:
-                if k == key:
-                    return v
+                # Convert stored key to float if needed
+                k_float = bytes_to_float(k) if isinstance(k, bytes) else k
+                
+                # If they're both bytes, compare as bytes
+                if isinstance(k, bytes) and isinstance(key, bytes):
+                    if k == key:
+                        return v
+                    continue
+                
+                # If they're both floats (or float-like), compare as floats
+                if not isinstance(k_float, bytes) and not isinstance(key, bytes):
+                    if k_float == key:
+                        return v
+                # Skip if types don't match
             return None
         
         # Binary search for larger pages
         left, right = 0, len(pairs) - 1
         while left <= right:
             mid = (left + right) // 2
-            if pairs[mid][0] == key:
-                return pairs[mid][1]
-            elif pairs[mid][0] < key:
+            mid_key, mid_value = pairs[mid]
+            
+            # Convert mid_key to float if needed
+            mid_key_float = bytes_to_float(mid_key) if isinstance(mid_key, bytes) else mid_key
+            
+            # Handle the case of incomparable types
+            if isinstance(mid_key_float, bytes) or isinstance(key, bytes):
+                if isinstance(mid_key, bytes) and isinstance(key, bytes):
+                    # Both are bytes, compare directly
+                    if mid_key == key:
+                        return mid_value
+                    elif mid_key < key:
+                        left = mid + 1
+                    else:
+                        right = mid - 1
+                else:
+                    # Can't compare different types, approximate
+                    left = mid + 1
+                continue
+            
+            # Both are floats
+            if mid_key_float == key:
+                return mid_value
+            elif mid_key_float < key:
                 left = mid + 1
             else:
                 right = mid - 1
             
         return None
         
-    def get_range_from_page(self, start_key: float, end_key: float, page_id: int) -> List[Tuple[float, str]]:
+    def get_range_from_page(self, start_key, end_key, page_id: int) -> List[Tuple[float, str]]:
         """Get all key-value pairs in the given range from a specific page."""
         result = []
         
@@ -326,47 +461,91 @@ class Run:
                 if i >= len(pairs):
                     break
                 key, value = pairs[i]
-                if start_key <= key <= end_key:
+                key_float = bytes_to_float(key) if isinstance(key, bytes) else key
+                
+                # Handle incomparable types
+                if isinstance(key_float, bytes) or isinstance(start_key, bytes) or isinstance(end_key, bytes):
+                    # If all are bytes, compare as bytes
+                    if isinstance(key, bytes) and isinstance(start_key, bytes) and isinstance(end_key, bytes):
+                        if start_key <= key <= end_key:
+                            result.append((key, value))
+                    continue
+                
+                # All are comparable types
+                if start_key <= key_float <= end_key:
                     result.append((key, value))
-                elif key > end_key:
+                elif key_float > end_key:
                     break
                     
         return result 
 
-    def _find_page_with_fence_pointers(self, key: float) -> Optional[int]:
-        """Use fence pointers to quickly find the page that might contain the key."""
+    def _find_page_with_fence_pointers(self, key) -> Optional[int]:
+        """Find the page that contains the key using fence pointers.
+        
+        This uses a binary search on the fence pointers to find which page
+        might contain the key, avoiding the need to check all pages.
+        
+        Parameters:
+        -----------
+        key : float
+            The key to search for
+            
+        Returns:
+        --------
+        int or None
+            Page ID if found, None if no pages match or fence pointers aren't available
+        """
+        # Basic checks for valid fence pointers
         if not self.page_min_keys or not self.page_max_keys:
             return None
             
-        # Linear search for small number of pages
-        if len(self.page_min_keys) <= 8:
-            for i, (min_key, max_key) in enumerate(zip(self.page_min_keys, self.page_max_keys)):
-                if min_key <= key <= max_key:
-                    return i
+        if len(self.page_min_keys) != len(self.page_max_keys):
+            logger.warning(f"Mismatched fence pointer arrays: {len(self.page_min_keys)} vs {len(self.page_max_keys)}")
             return None
             
-        # Binary search for larger number of pages
-        left = 0
-        right = len(self.page_min_keys) - 1
+        # First check if key is outside the run's range
+        if self.min_key is not None and isinstance(self.min_key, type(key)) and key < self.min_key:
+            return None
+        if self.max_key is not None and isinstance(self.max_key, type(key)) and key > self.max_key:
+            return None
+            
+        # Binary search on fence pointers to find potential page
+        left, right = 0, len(self.page_min_keys) - 1
         
         while left <= right:
             mid = (left + right) // 2
-            if mid >= len(self.page_min_keys):
-                break
-                
+            
+            # Get min and max keys for this range - they should already be converted to float
             min_key = self.page_min_keys[mid]
             max_key = self.page_max_keys[mid]
             
+            # Handle incomparable types
+            if (isinstance(min_key, bytes) and not isinstance(key, bytes)) or \
+               (not isinstance(min_key, bytes) and isinstance(key, bytes)) or \
+               (isinstance(max_key, bytes) and not isinstance(key, bytes)) or \
+               (not isinstance(max_key, bytes) and isinstance(key, bytes)):
+                # Can't use binary search with incomparable types
+                return self._find_page(key)
+            
+            # Check if key is in this page's range
             if min_key <= key <= max_key:
                 return mid
-            elif max_key < key:
-                left = mid + 1
-            else:
+            
+            # If not, adjust search bounds
+            if key < min_key:
                 right = mid - 1
+            else:
+                left = mid + 1
                 
+        # Check the closest page
+        if left < len(self.page_min_keys):
+            return left
+        elif right >= 0:
+            return right
+            
         return None
             
-    def _find_page(self, key: float) -> int:
+    def _find_page(self, key) -> int:
         """Find the page that might contain the key."""
         # Try finding page with fence pointers first
         page = self._find_page_with_fence_pointers(key)
@@ -390,9 +569,29 @@ class Run:
                 mid = (left + right) // 2
                 if mid >= len(pairs):
                     break
-                if pairs[mid][0] == key:
+                
+                mid_key = pairs[mid][0]
+                mid_key_float = bytes_to_float(mid_key) if isinstance(mid_key, bytes) else mid_key
+                
+                # Handle incomparable types
+                if isinstance(mid_key_float, bytes) or isinstance(key, bytes):
+                    if isinstance(mid_key, bytes) and isinstance(key, bytes):
+                        # Both are bytes, compare directly
+                        if mid_key == key:
+                            return mid // entries_per_page
+                        elif mid_key < key:
+                            left = mid + 1
+                        else:
+                            right = mid
+                    else:
+                        # Can't compare different types, move forward
+                        left = mid + 1
+                    continue
+                
+                # Both are comparable types
+                if mid_key_float == key:
                     return mid // entries_per_page
-                elif pairs[mid][0] < key:
+                elif mid_key_float < key:
                     left = mid + 1
                 else:
                     right = mid

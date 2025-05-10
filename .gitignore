@@ -1,6 +1,31 @@
-.DS_Store
+# Python cache files
 __pycache__/
+*.py[cod]
+*$py.class
+
+# Virtual environments
 venv/
-data/
-learned_test_data/
+env/
+ENV/
+
+# OS specific files
+.DS_Store
+Thumbs.db
+
+# Data and model directories
+classifier_data/
 classifier_test_data/
+data/
+hybrid_test_data/
+learned_data/
+learned_test_data/
+test_data/
+tests/
+traditional_data/
+traditional_test_data/
+
+# Generated Cython files
+fast_classifier.pyx
+*.c
+*.so
+*.pyd

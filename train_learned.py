@@ -6,7 +6,8 @@ import struct
 import numpy as np
 import random
 import matplotlib.pyplot as plt
-from lsm import TraditionalLSMTree, Constants, BloomFilter
+from lsm import TraditionalLSMTree, Constants
+from lsm.bloom import BloomFilter
 from ml.learned_bloom import LearnedBloomFilterManager
 
 def load_runs_data(data_dir="data"):
