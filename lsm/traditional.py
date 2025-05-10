@@ -219,34 +219,27 @@ class TraditionalLSMTree:
             return True
         
     def get(self, key: float) -> Optional[str]:
-        """Get value for a key."""
-        logger.debug(f"Looking up key: {key}")
-        
-        # Convert to fixed-size byte representation
-        bytes_key = self._float_to_fixed_bytes(key)
-        
-        # Check memory buffer first
-        bytes_value = self.buffer.get(bytes_key)
-        if bytes_value is not None:
-            # Convert back to string
-            value = bytes_value.rstrip(b'\x00').decode('utf-8')
-            logger.debug(f"Key found in memory buffer with value: {value}")
-            return None if is_tombstone(value) else value
+        """Get a value by key."""
+        # First check buffer (most recent data)
+        buffer_value = self.buffer.get(key)
+        if buffer_value is not None:
+            return buffer_value
             
-        logger.debug("Key not found in memory buffer, checking disk levels")
+        # Then check each level in order
+        for level in self.levels:
+            level_value = level.get(key)
+            if level_value is not None:
+                # Handle the case where level_value is bytes
+                if isinstance(level_value, bytes):
+                    return level_value.rstrip(b'\x00').decode('utf-8')
+                # Handle the case where level_value is already a string
+                elif isinstance(level_value, str):
+                    return level_value
+                # For any other type, convert to string
+                else:
+                    return str(level_value)
         
-        # Check each level
-        for i, level in enumerate(self.levels):
-            logger.debug(f"Checking level {i}")
-            bytes_value = level.get(bytes_key)
-            if bytes_value is not None:
-                # Convert back to string
-                value = bytes_value.rstrip(b'\x00').decode('utf-8')
-                logger.debug(f"Key found in level {i} with value: {value}")
-                return value
-                
-        logger.debug("Key not found in any level")
-        return None
+        return None  # Key not found
         
     def range(self, start_key: float, end_key: float) -> List[Tuple[float, str]]:
         """Get range of key-value pairs."""

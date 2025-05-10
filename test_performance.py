@@ -1009,17 +1009,6 @@ class PerformanceTest:
         accuracy_classifier = correct_classifier / total if total > 0 else 0
         accuracy_learned = correct_learned / total if total > 0 else 0
         
-        # Calculate false negative rate
-        if (true_positives + false_negatives_classifier) > 0:
-            false_negative_rate_classifier = false_negatives_classifier / (true_positives + false_negatives_classifier)
-        else:
-            false_negative_rate_classifier = 0.0
-            
-        if (true_positives + false_negatives_learned) > 0:
-            false_negative_rate_learned = false_negatives_learned / (true_positives + false_negatives_learned)
-        else:
-            false_negative_rate_learned = 0.0
-        
         # Calculate level-specific FNR
         for level in level_metrics_classifier:
             metrics = level_metrics_classifier[level]
@@ -1028,6 +1017,29 @@ class PerformanceTest:
         for level in level_metrics_learned:
             metrics = level_metrics_learned[level]
             metrics['fnr'] = metrics['fn'] / metrics['total'] if metrics['total'] > 0 else 0
+            
+        # Calculate overall FNR from level-specific metrics
+        total_fn_classifier = 0
+        total_positive_classifier = 0
+        for level, metrics in level_metrics_classifier.items():
+            total_fn_classifier += metrics['fn']
+            total_positive_classifier += metrics['total']
+            
+        if total_positive_classifier > 0:
+            false_negative_rate_classifier = total_fn_classifier / total_positive_classifier
+        else:
+            false_negative_rate_classifier = 0.0
+            
+        total_fn_learned = 0
+        total_positive_learned = 0
+        for level, metrics in level_metrics_learned.items():
+            total_fn_learned += metrics['fn']
+            total_positive_learned += metrics['total']
+            
+        if total_positive_learned > 0:
+            false_negative_rate_learned = total_fn_learned / total_positive_learned
+        else:
+            false_negative_rate_learned = 0.0
             
         # Update global metrics
         self.metrics['get']['traditional'].extend(traditional_times)
